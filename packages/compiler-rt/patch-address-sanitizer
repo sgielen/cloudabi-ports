@@ -1,0 +1,3940 @@
+diff --git a/cmake/Modules/CompilerRTUtils.cmake b/cmake/Modules/CompilerRTUtils.cmake
+index 9f79a9b..d9fffbf 100644
+--- a/cmake/Modules/CompilerRTUtils.cmake
++++ b/cmake/Modules/CompilerRTUtils.cmake
+@@ -131,6 +131,17 @@ macro(test_target_arch arch def)
+   foreach(arg ${ARGN})
+     set(argstring "${argstring} ${arg}")
+   endforeach()
++
++  # TODO(sjors): check_compile_definition fails on CloudABI, since it tries to
++  # compile a source file with only 'int main(...)' with -nodefaultlibs. This
++  # fails, because then the CloudABI linker fails to find a 'program_main'
++  # symbol. Because of this, we short-circuit this step by saying i386 and
++  # x86_64 are supported.
++  if(${arch} STREQUAL "i386" OR ${arch} STREQUAL "x86_64")
++    set(CAN_TARGET_${arch} TRUE)
++    list(APPEND COMPILER_RT_SUPPORTED_ARCH ${arch})
++  else()
++
+   check_compile_definition("${def}" "${argstring}" HAS_${arch}_DEF)
+   if(NOT DEFINED CAN_TARGET_${arch})
+     if(NOT HAS_${arch}_DEF)
+@@ -157,6 +168,8 @@ macro(test_target_arch arch def)
+     # Bail out if we cannot target the architecture we plan to test.
+     message(FATAL_ERROR "Cannot compile for ${arch}:\n${TARGET_${arch}_OUTPUT}")
+   endif()
++
++  endif()
+ endmacro()
+ 
+ macro(detect_target_arch)
+diff --git a/cmake/config-ix.cmake b/cmake/config-ix.cmake
+index 9e0c477..86ac3ca 100644
+--- a/cmake/config-ix.cmake
++++ b/cmake/config-ix.cmake
+@@ -487,7 +487,8 @@ list_replace(COMPILER_RT_SANITIZERS_TO_BUILD all "${ALL_SANITIZERS}")
+ 
+ if (SANITIZER_COMMON_SUPPORTED_ARCH AND NOT LLVM_USE_SANITIZER AND
+     (OS_NAME MATCHES "Android|Darwin|Linux|FreeBSD|NetBSD|Fuchsia|SunOS" OR
+-    (OS_NAME MATCHES "Windows" AND (NOT MINGW AND NOT CYGWIN))))
++    (OS_NAME MATCHES "Windows" AND (NOT MINGW AND NOT CYGWIN)) OR
++    (CMAKE_C_COMPILER MATCHES "cloudabi")))
+   set(COMPILER_RT_HAS_SANITIZER_COMMON TRUE)
+ else()
+   set(COMPILER_RT_HAS_SANITIZER_COMMON FALSE)
+diff --git a/lib/asan/CMakeLists.txt b/lib/asan/CMakeLists.txt
+index fbd72f6..71094b8 100644
+--- a/lib/asan/CMakeLists.txt
++++ b/lib/asan/CMakeLists.txt
+@@ -3,6 +3,7 @@
+ set(ASAN_SOURCES
+   asan_allocator.cc
+   asan_activation.cc
++  asan_cloudabi.cc
+   asan_debugging.cc
+   asan_descriptions.cc
+   asan_errors.cc
+diff --git a/lib/asan/asan_cloudabi.cc b/lib/asan/asan_cloudabi.cc
+new file mode 100644
+index 0000000..fd3d8ad
+--- /dev/null
++++ b/lib/asan/asan_cloudabi.cc
+@@ -0,0 +1,58 @@
++//===-- asan_cloudabi.cc --------------------------------------------------===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is a part of AddressSanitizer, an address sanity checker.
++//
++// CloudABI-specific details.
++//===----------------------------------------------------------------------===//
++
++#include "sanitizer_common/sanitizer_platform.h"
++#if SANITIZER_CLOUDABI
++
++#include "asan_interceptors.h"
++#include "asan_internal.h"
++#include "asan_premap_shadow.h"
++#include "asan_thread.h"
++#include "sanitizer_common/sanitizer_flags.h"
++#include "sanitizer_common/sanitizer_freebsd.h"
++#include "sanitizer_common/sanitizer_libc.h"
++#include "sanitizer_common/sanitizer_procmaps.h"
++
++#include <sys/time.h>
++#include <sys/resource.h>
++#include <sys/mman.h>
++#include <sys/types.h>
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <unwind.h>
++#include <link.h>
++
++#define PATH_MAX 256
++
++namespace __asan {
++
++void InitializePlatformInterceptors() {}
++void InitializePlatformExceptionHandlers() {}
++bool IsSystemHeapAddress (uptr addr) { return false; }
++
++void AsanApplyToGlobals(globals_op_fptr op, const void *needle) {
++  UNIMPLEMENTED();
++}
++
++uptr FindDynamicShadowStart() {
++  UNIMPLEMENTED();
++}
++
++} // namespace __asan
++
++#endif  // SANITIZER_CLOUDABI
+diff --git a/lib/asan/asan_errors.cc b/lib/asan/asan_errors.cc
+index 0f4a3ab..027933d 100644
+--- a/lib/asan/asan_errors.cc
++++ b/lib/asan/asan_errors.cc
+@@ -40,7 +40,9 @@ static void OnStackUnwind(const SignalContext &sig,
+ }
+ 
+ void ErrorDeadlySignal::Print() {
++#if !SANITIZER_CLOUDABI
+   ReportDeadlySignal(signal, tid, &OnStackUnwind, &scariness);
++#endif
+ }
+ 
+ void ErrorDoubleFree::Print() {
+diff --git a/lib/asan/asan_fake_stack.cc b/lib/asan/asan_fake_stack.cc
+index 1c6184e..340c112 100644
+--- a/lib/asan/asan_fake_stack.cc
++++ b/lib/asan/asan_fake_stack.cc
+@@ -171,7 +171,7 @@ void FakeStack::ForEachFakeFrame(RangeIteratorCallback callback, void *arg) {
+   }
+ }
+ 
+-#if (SANITIZER_LINUX && !SANITIZER_ANDROID) || SANITIZER_FUCHSIA
++#if (SANITIZER_LINUX && !SANITIZER_ANDROID) || SANITIZER_FUCHSIA || SANITIZER_CLOUDABI
+ static THREADLOCAL FakeStack *fake_stack_tls;
+ 
+ FakeStack *GetTLSFakeStack() {
+@@ -183,7 +183,7 @@ void SetTLSFakeStack(FakeStack *fs) {
+ #else
+ FakeStack *GetTLSFakeStack() { return 0; }
+ void SetTLSFakeStack(FakeStack *fs) { }
+-#endif  // (SANITIZER_LINUX && !SANITIZER_ANDROID) || SANITIZER_FUCHSIA
++#endif  // (SANITIZER_LINUX && !SANITIZER_ANDROID) || SANITIZER_FUCHSIA || SANITIZER_CLOUDABI
+ 
+ static FakeStack *GetFakeStack() {
+   AsanThread *t = GetCurrentThread();
+diff --git a/lib/asan/asan_flags.inc b/lib/asan/asan_flags.inc
+index 00071d3..4c3e6c4 100644
+--- a/lib/asan/asan_flags.inc
++++ b/lib/asan/asan_flags.inc
+@@ -140,7 +140,7 @@ ASAN_FLAG(
+     "invalid pointer pairs (e.g. when pointers belong to different objects). "
+     "The bigger the value the harder we try.")
+ ASAN_FLAG(
+-    bool, detect_container_overflow, true,
++    bool, detect_container_overflow, false /* disabled because of false positive indicated on URL below */,
+     "If true, honor the container overflow annotations. See "
+     "https://github.com/google/sanitizers/wiki/AddressSanitizerContainerOverflow")
+ ASAN_FLAG(int, detect_odr_violation, 2,
+diff --git a/lib/asan/asan_globals.cc b/lib/asan/asan_globals.cc
+index 0db65d0..8cf1f75 100644
+--- a/lib/asan/asan_globals.cc
++++ b/lib/asan/asan_globals.cc
+@@ -114,7 +114,9 @@ int GetGlobalsForAddress(uptr addr, Global *globals, u32 *reg_sites,
+     if (flags()->report_globals >= 2)
+       ReportGlobal(g, "Search");
+     if (IsAddressNearGlobal(addr, g)) {
+-      globals[res] = g;
++      // Use internal_memcpy() here which doesn't do poison checking; g is poisoned
++      // because users shouldn't touch it, but ASAN should
++      internal_memcpy(&globals[res], &g, sizeof(g));
+       if (reg_sites)
+         reg_sites[res] = FindRegistrationSite(&g);
+       res++;
+diff --git a/lib/asan/asan_interceptors.cc b/lib/asan/asan_interceptors.cc
+index cb7dcb3..1795445 100644
+--- a/lib/asan/asan_interceptors.cc
++++ b/lib/asan/asan_interceptors.cc
+@@ -195,6 +195,17 @@ static thread_return_t THREAD_CALLING_CONV asan_thread_start(void *arg) {
+   return t->ThreadStart(GetTid(), &param->is_registered);
+ }
+ 
++#if SANITIZER_CLOUDABI
++// pthread_attr_getdetachstate is not intercepted on CloudABI, so use the
++// original function
++extern "C" int pthread_attr_getdetachstate(const void*, int*);
++namespace __interception {
++int real_pthread_attr_getdetachstate(const void *a, int *d) {
++	return pthread_attr_getdetachstate(a, d);
++}
++}
++#endif
++
+ INTERCEPTOR(int, pthread_create, void *thread,
+     void *attr, void *(*start_routine)(void*), void *arg) {
+   EnsureMainThreadIDIsCorrect();
+@@ -284,10 +295,12 @@ INTERCEPTOR(int, swapcontext, struct ucontext_t *oucp,
+ #define siglongjmp __siglongjmp14
+ #endif
+ 
++#if ASAN_INTERCEPT_LONGJMP
+ INTERCEPTOR(void, longjmp, void *env, int val) {
+   __asan_handle_no_return();
+   REAL(longjmp)(env, val);
+ }
++#endif
+ 
+ #if ASAN_INTERCEPT__LONGJMP
+ INTERCEPTOR(void, _longjmp, void *env, int val) {
+@@ -579,11 +592,12 @@ void InitializeAsanInterceptors() {
+ #endif
+ 
+   // Intecept jump-related functions.
+-  ASAN_INTERCEPT_FUNC(longjmp);
+-
+ #if ASAN_INTERCEPT_SWAPCONTEXT
+   ASAN_INTERCEPT_FUNC(swapcontext);
+ #endif
++#if ASAN_INTERCEPT_LONGJMP
++  ASAN_INTERCEPT_FUNC(longjmp);
++#endif
+ #if ASAN_INTERCEPT__LONGJMP
+   ASAN_INTERCEPT_FUNC(_longjmp);
+ #endif
+diff --git a/lib/asan/asan_interceptors.h b/lib/asan/asan_interceptors.h
+index e13bdec..91f89dd 100644
+--- a/lib/asan/asan_interceptors.h
++++ b/lib/asan/asan_interceptors.h
+@@ -41,22 +41,31 @@ void InitializePlatformInterceptors();
+ 
+ // Use macro to describe if specific function should be
+ // intercepted on a given platform.
+-#if !SANITIZER_WINDOWS
++#if SANITIZER_WINDOWS
++# define ASAN_INTERCEPT_ATOLL_AND_STRTOLL 0
++# define ASAN_INTERCEPT_INDEX 0
++# define ASAN_INTERCEPT_PTHREAD_CREATE 0
++# define ASAN_INTERCEPT_FORK 0
++#elif SANITIZER_CLOUDABI
++# define ASAN_INTERCEPT_ATOLL_AND_STRTOLL 1
++# define ASAN_INTERCEPT_INDEX 0
++# define ASAN_INTERCEPT_PTHREAD_CREATE 1
++# define ASAN_INTERCEPT_FORK 0
++#else
+ # define ASAN_INTERCEPT_ATOLL_AND_STRTOLL 1
+-# define ASAN_INTERCEPT__LONGJMP 1
+ # define ASAN_INTERCEPT_INDEX 1
+ # define ASAN_INTERCEPT_PTHREAD_CREATE 1
+ # define ASAN_INTERCEPT_FORK 1
++#endif
++
++#if !SANITIZER_WINDOWS && !SANITIZER_CLOUDABI
++# define ASAN_INTERCEPT__LONGJMP 1
+ #else
+-# define ASAN_INTERCEPT_ATOLL_AND_STRTOLL 0
+ # define ASAN_INTERCEPT__LONGJMP 0
+-# define ASAN_INTERCEPT_INDEX 0
+-# define ASAN_INTERCEPT_PTHREAD_CREATE 0
+-# define ASAN_INTERCEPT_FORK 0
+ #endif
+ 
+ #if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD || \
+-    SANITIZER_SOLARIS
++    SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ # define ASAN_USE_ALIAS_ATTRIBUTE_FOR_INDEX 1
+ #else
+ # define ASAN_USE_ALIAS_ATTRIBUTE_FOR_INDEX 0
+@@ -68,7 +77,13 @@ void InitializePlatformInterceptors();
+ # define ASAN_INTERCEPT_SWAPCONTEXT 0
+ #endif
+ 
+-#if !SANITIZER_WINDOWS
++#if !SANITIZER_CLOUDABI
++# define ASAN_INTERCEPT_LONGJMP 1
++#else
++# define ASAN_INTERCEPT_LONGJMP 0
++#endif
++
++#if !SANITIZER_WINDOWS && !SANITIZER_CLOUDABI
+ # define ASAN_INTERCEPT_SIGLONGJMP 1
+ #else
+ # define ASAN_INTERCEPT_SIGLONGJMP 0
+@@ -83,7 +98,7 @@ void InitializePlatformInterceptors();
+ // Android bug: https://code.google.com/p/android/issues/detail?id=61799
+ #if ASAN_HAS_EXCEPTIONS && !SANITIZER_WINDOWS && \
+     !(SANITIZER_ANDROID && defined(__i386)) && \
+-    !SANITIZER_SOLARIS
++    !SANITIZER_SOLARIS && !SANITIZER_CLOUDABI
+ # define ASAN_INTERCEPT___CXA_THROW 1
+ #else
+ # define ASAN_INTERCEPT___CXA_THROW 0
+diff --git a/lib/asan/asan_malloc_linux.cc b/lib/asan/asan_malloc_linux.cc
+index 6697ff8..0e654bb 100644
+--- a/lib/asan/asan_malloc_linux.cc
++++ b/lib/asan/asan_malloc_linux.cc
+@@ -16,7 +16,7 @@
+ 
+ #include "sanitizer_common/sanitizer_platform.h"
+ #if SANITIZER_FREEBSD || SANITIZER_FUCHSIA || SANITIZER_LINUX || \
+-    SANITIZER_NETBSD || SANITIZER_SOLARIS
++    SANITIZER_NETBSD || SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ 
+ #include "sanitizer_common/sanitizer_tls_get_addr.h"
+ #include "asan_allocator.h"
+@@ -236,4 +236,4 @@ void ReplaceSystemMalloc() {
+ #endif  // SANITIZER_ANDROID
+ 
+ #endif  // SANITIZER_FREEBSD || SANITIZER_FUCHSIA || SANITIZER_LINUX ||
+-        // SANITIZER_NETBSD || SANITIZER_SOLARIS
++        // SANITIZER_NETBSD || SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+diff --git a/lib/asan/asan_mapping.h b/lib/asan/asan_mapping.h
+index d3f360f..9574fb1 100644
+--- a/lib/asan/asan_mapping.h
++++ b/lib/asan/asan_mapping.h
+@@ -174,6 +174,8 @@ static const u64 kWindowsShadowOffset32 = 3ULL << 28;  // 0x30000000
+ #    else
+ #      define SHADOW_OFFSET kIosShadowOffset32
+ #    endif
++#  elif SANITIZER_CLOUDABI
++#   define SHADOW_OFFSET kDefaultShadowOffset32
+ #  else
+ #    define SHADOW_OFFSET kDefaultShadowOffset32
+ #  endif
+@@ -200,6 +202,8 @@ static const u64 kWindowsShadowOffset32 = 3ULL << 28;  // 0x30000000
+ #   define SHADOW_OFFSET kMIPS64_ShadowOffset64
+ #  elif SANITIZER_WINDOWS64
+ #   define SHADOW_OFFSET __asan_shadow_memory_dynamic_address
++#  elif SANITIZER_CLOUDABI
++#   define SHADOW_OFFSET kDefaultShadowOffset64
+ #  else
+ #   define SHADOW_OFFSET kDefaultShort64bitShadowOffset
+ #  endif
+diff --git a/lib/asan/asan_posix.cc b/lib/asan/asan_posix.cc
+index 17c28b0..c15975e 100644
+--- a/lib/asan/asan_posix.cc
++++ b/lib/asan/asan_posix.cc
+@@ -32,11 +32,13 @@
+ 
+ namespace __asan {
+ 
++#if !SANITIZER_CLOUDABI
+ void AsanOnDeadlySignal(int signo, void *siginfo, void *context) {
+   StartReportDeadlySignal();
+   SignalContext sig(siginfo, context);
+   ReportDeadlySignal(sig);
+ }
++#endif
+ 
+ // ---------------------- TSD ---------------- {{{1
+ 
+diff --git a/lib/asan/asan_rtl.cc b/lib/asan/asan_rtl.cc
+index 21fd0e2..549db5e 100644
+--- a/lib/asan/asan_rtl.cc
++++ b/lib/asan/asan_rtl.cc
+@@ -379,8 +379,10 @@ static void AsanInitInternal() {
+   // initialization steps look at flags().
+   InitializeFlags();
+ 
++#if !SANITIZER_CLOUDABI
+   AsanCheckIncompatibleRT();
+   AsanCheckDynamicRTPrereqs();
++#endif
+   AvoidCVE_2016_2143();
+ 
+   SetCanPoisonMemory(flags()->poison_heap);
+@@ -390,8 +392,10 @@ static void AsanInitInternal() {
+ 
+   InitializeHighMemEnd();
+ 
++#if !SANITIZER_CLOUDABI
+   // Make sure we are not statically linked.
+   AsanDoesNotSupportStaticLinkage();
++#endif
+ 
+   // Install tool-specific callbacks in sanitizer_common.
+   AddDieCallback(AsanDie);
+@@ -403,8 +407,10 @@ static void AsanInitInternal() {
+   __asan_option_detect_stack_use_after_return =
+       flags()->detect_stack_use_after_return;
+ 
++#if !SANITIZER_CLOUDABI
+   // Re-exec ourselves if we need to set additional env or command line args.
+   MaybeReexec();
++#endif
+ 
+   // Setup internal allocator callback.
+   SetLowLevelAllocateMinAlignment(SHADOW_GRANULARITY);
+@@ -419,12 +425,16 @@ static void AsanInitInternal() {
+ 
+   ReplaceSystemMalloc();
+ 
++#if !SANITIZER_CLOUDABI
+   DisableCoreDumperIfNecessary();
++#endif
+ 
+   InitializeShadowMemory();
+ 
+   AsanTSDInit(PlatformTSDDtor);
++#if !SANITIZER_CLOUDABI
+   InstallDeadlySignalHandlers(AsanOnDeadlySignal);
++#endif
+ 
+   AllocatorOptions allocator_options;
+   allocator_options.SetFrom(flags(), common_flags());
+@@ -441,7 +451,9 @@ static void AsanInitInternal() {
+   if (flags()->atexit)
+     Atexit(asan_atexit);
+ 
++#if !SANITIZER_CLOUDABI
+   InitializeCoverage(common_flags()->coverage, common_flags()->coverage_dir);
++#endif
+ 
+   // Now that ASan runtime is (mostly) initialized, deactivate it if
+   // necessary, so that it can be re-activated when requested.
+diff --git a/lib/asan/asan_thread.cc b/lib/asan/asan_thread.cc
+index ad81512..3ac94cd 100644
+--- a/lib/asan/asan_thread.cc
++++ b/lib/asan/asan_thread.cc
+@@ -23,6 +23,8 @@
+ #include "sanitizer_common/sanitizer_tls_get_addr.h"
+ #include "lsan/lsan_common.h"
+ 
++#include <cloudabi_syscalls.h>
++
+ namespace __asan {
+ 
+ // AsanThreadContext implementation.
+@@ -274,7 +276,12 @@ AsanThread *CreateMainThread() {
+       /* start_routine */ nullptr, /* arg */ nullptr, /* parent_tid */ 0,
+       /* stack */ nullptr, /* detached */ true);
+   SetCurrentThread(main_thread);
+-  main_thread->ThreadStart(internal_getpid(),
++#if !SANITIZER_CLOUDABI
++  tid_t pid = internal_getpid();
++#else
++  tid_t pid = 0;
++#endif
++  main_thread->ThreadStart(pid,
+                            /* signal_thread_is_registered */ nullptr);
+   return main_thread;
+ }
+@@ -292,7 +299,12 @@ void AsanThread::SetThreadStackAndTls(const InitOptions *options) {
+   tls_end_ = tls_begin_ + tls_size;
+   dtls_ = DTLS_Get();
+ 
++  const auto bounds = GetStackBounds();
+   int local;
++
++  char clbuf[16];
++  // NOTE: this next assertion fails without this call:
++  internal_snprintf(clbuf, sizeof(clbuf), "%p", &local);
+   CHECK(AddrIsInStack((uptr)&local));
+ }
+ 
+diff --git a/lib/interception/CMakeLists.txt b/lib/interception/CMakeLists.txt
+index 18d2594..d1cb612 100644
+--- a/lib/interception/CMakeLists.txt
++++ b/lib/interception/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ # Build for the runtime interception helper library.
+ 
+ set(INTERCEPTION_SOURCES
++  interception_cloudabi.cc
+   interception_linux.cc
+   interception_mac.cc
+   interception_win.cc
+diff --git a/lib/interception/interception.h b/lib/interception/interception.h
+index cba4849..c789694 100644
+--- a/lib/interception/interception.h
++++ b/lib/interception/interception.h
+@@ -19,7 +19,7 @@
+ 
+ #if !SANITIZER_LINUX && !SANITIZER_FREEBSD && !SANITIZER_MAC && \
+     !SANITIZER_NETBSD && !SANITIZER_WINDOWS && !SANITIZER_FUCHSIA && \
+-    !SANITIZER_SOLARIS
++    !SANITIZER_SOLARIS && !SANITIZER_CLOUDABI
+ # error "Interception doesn't work on this operating system."
+ #endif
+ 
+@@ -266,7 +266,7 @@ typedef unsigned long uptr;  // NOLINT
+ #define INCLUDED_FROM_INTERCEPTION_LIB
+ 
+ #if SANITIZER_LINUX || SANITIZER_FREEBSD || SANITIZER_NETBSD || \
+-    SANITIZER_SOLARIS
++    SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ 
+ # include "interception_linux.h"
+ # define INTERCEPT_FUNCTION(func) INTERCEPT_FUNCTION_LINUX_OR_FREEBSD(func)
+diff --git a/lib/interception/interception_cloudabi.cc b/lib/interception/interception_cloudabi.cc
+new file mode 100644
+index 0000000..1af8ccc
+--- /dev/null
++++ b/lib/interception/interception_cloudabi.cc
+@@ -0,0 +1,185 @@
++//===-- interception_cloudabi.cc --------------------------------*- C++ -*-===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is a part of AddressSanitizer, an address sanity checker.
++//
++// CloudABI-specific interception implementation.
++//===----------------------------------------------------------------------===//
++
++#include "interception.h"
++
++#if SANITIZER_CLOUDABI
++
++#include "sanitizer_common/sanitizer_libc.h"
++#include "sanitizer_common/sanitizer_common.h"
++
++#include <cloudabi_types.h>
++#include <cloudabi_syscalls.h>
++#include <cloudlibc_interceptors.h>
++#include <errno.h>
++
++// If you're having problems during bootstrapping of Address Sanitizer on
++// CloudABI, there won't be a functional stderr by default, and you won't have
++// had a chance yet to fswap stderr. In this case, set the definition below to
++// true, and the cloudabi_debug function will print stuff directly to FD 0.
++// Also, if fwrite has been intercepted, it will also write to FD 0.  This is
++// disabled by default, because FD 0 may not be a safe file descriptor to send
++// logs to.
++#define CLOUDABI_DEBUGGING_FD0 false
++
++void cloudabi_debug(const char *message) {
++	if(CLOUDABI_DEBUGGING_FD0) {
++		cloudabi_ciovec_t iov = {.buf = message, .buf_len = __asan::internal_strlen(message)};
++		size_t bytes_written;
++		cloudabi_sys_fd_write(0, &iov, 1, &bytes_written);
++	}
++}
++
++static size_t internal_fwrite(const void *buf, size_t size, size_t nitems, FILE *stream) {
++	if(CLOUDABI_DEBUGGING_FD0 && stream == stderr && (size * nitems) > 0) {
++		// Maybe, stderr did not yet swap to fd 0. We'll send it to fd 0 ourselves.
++		cloudabi_ciovec_t iov = {.buf = buf, .buf_len = size * nitems};
++		size_t bytes_written;
++		cloudabi_errno_t error = cloudabi_sys_fd_write(0, &iov, 1, &bytes_written);
++		if(error != 0) {
++			errno = error == ENOTCAPABLE ? EBADF : error;
++			return -1;
++		}
++		return bytes_written / size;
++	} else {
++		return __cloudlibc_fwrite(buf, size, nitems, stream);
++	}
++}
++
++namespace __interception {
++bool GetRealFunctionAddress(const char *func_name, uptr *func_addr,
++    uptr real, uptr wrapper) {
++
++  if(func_name[0] == 0) *func_addr = 0;
++  else if(CLOUDABI_DEBUGGING_FD0 && internal_strcmp(func_name, "fwrite") == 0) *func_addr = (uptr)&internal_fwrite;
++#define CLOUDABI_INTERCEPT(x) \
++  else if(internal_strcmp(func_name, #x) == 0) *func_addr = (uptr)&__cloudlibc_##x
++  CLOUDABI_INTERCEPT(fwrite);
++  CLOUDABI_INTERCEPT(strnlen);
++  CLOUDABI_INTERCEPT(strncmp);
++  CLOUDABI_INTERCEPT(strcmp);
++  CLOUDABI_INTERCEPT(memset);
++  CLOUDABI_INTERCEPT(memcpy);
++  CLOUDABI_INTERCEPT(fflush);
++  CLOUDABI_INTERCEPT(strlen);
++  CLOUDABI_INTERCEPT(strerror);
++  CLOUDABI_INTERCEPT(write);
++  CLOUDABI_INTERCEPT(strcasecmp);
++  CLOUDABI_INTERCEPT(strncasecmp);
++  CLOUDABI_INTERCEPT(asprintf);
++  CLOUDABI_INTERCEPT(atoi);
++  CLOUDABI_INTERCEPT(atol);
++  CLOUDABI_INTERCEPT(atoll);
++  CLOUDABI_INTERCEPT(backtrace);
++  CLOUDABI_INTERCEPT(backtrace_symbols);
++  CLOUDABI_INTERCEPT(clock_getres);
++  CLOUDABI_INTERCEPT(clock_gettime);
++  CLOUDABI_INTERCEPT(fclose);
++  CLOUDABI_INTERCEPT(fdopen);
++  CLOUDABI_INTERCEPT(fprintf);
++  CLOUDABI_INTERCEPT(frexp);
++  CLOUDABI_INTERCEPT(frexpf);
++  CLOUDABI_INTERCEPT(frexpl);
++  CLOUDABI_INTERCEPT(fscanf);
++  CLOUDABI_INTERCEPT(getaddrinfo);
++  CLOUDABI_INTERCEPT(getnameinfo);
++  CLOUDABI_INTERCEPT(getsockopt);
++  CLOUDABI_INTERCEPT(ioctl);
++  CLOUDABI_INTERCEPT(lgamma);
++  CLOUDABI_INTERCEPT(lgammaf);
++  CLOUDABI_INTERCEPT(lgammal);
++  CLOUDABI_INTERCEPT(mbsnrtowcs);
++  CLOUDABI_INTERCEPT(mbsrtowcs);
++  CLOUDABI_INTERCEPT(mbstowcs);
++  CLOUDABI_INTERCEPT(poll);
++  CLOUDABI_INTERCEPT(pthread_attr_getdetachstate);
++  CLOUDABI_INTERCEPT(pthread_attr_getstacksize);
++  CLOUDABI_INTERCEPT(pthread_condattr_getpshared);
++  CLOUDABI_INTERCEPT(pthread_create);
++  CLOUDABI_INTERCEPT(pthread_join);
++  CLOUDABI_INTERCEPT(pthread_mutex_lock);
++  CLOUDABI_INTERCEPT(pthread_mutex_unlock);
++  CLOUDABI_INTERCEPT(pthread_mutexattr_getpshared);
++  CLOUDABI_INTERCEPT(pthread_mutexattr_gettype);
++  CLOUDABI_INTERCEPT(pthread_rwlockattr_getpshared);
++  CLOUDABI_INTERCEPT(pwrite);
++  CLOUDABI_INTERCEPT(readdir);
++  CLOUDABI_INTERCEPT(remquo);
++  CLOUDABI_INTERCEPT(remquof);
++  CLOUDABI_INTERCEPT(remquol);
++  CLOUDABI_INTERCEPT(setlocale);
++  CLOUDABI_INTERCEPT(snprintf);
++  CLOUDABI_INTERCEPT(sscanf);
++  CLOUDABI_INTERCEPT(strdup);
++  CLOUDABI_INTERCEPT(strndup);
++  CLOUDABI_INTERCEPT(strerror_r);
++  CLOUDABI_INTERCEPT(strncpy);
++  CLOUDABI_INTERCEPT(strtoimax);
++  CLOUDABI_INTERCEPT(strtol);
++  CLOUDABI_INTERCEPT(strtoll);
++  CLOUDABI_INTERCEPT(strtoumax);
++  CLOUDABI_INTERCEPT(times);
++  CLOUDABI_INTERCEPT(vasprintf);
++  CLOUDABI_INTERCEPT(vfprintf);
++  CLOUDABI_INTERCEPT(vfscanf);
++  CLOUDABI_INTERCEPT(vsnprintf);
++  CLOUDABI_INTERCEPT(vsscanf);
++  CLOUDABI_INTERCEPT(wcrtomb);
++  CLOUDABI_INTERCEPT(wcslen);
++  CLOUDABI_INTERCEPT(wcsnlen);
++  CLOUDABI_INTERCEPT(wcsnrtombs);
++  CLOUDABI_INTERCEPT(wcsrtombs);
++  CLOUDABI_INTERCEPT(wcstombs);
++  CLOUDABI_INTERCEPT(writev);
++  CLOUDABI_INTERCEPT(strstr);
++  CLOUDABI_INTERCEPT(strchr);
++  CLOUDABI_INTERCEPT(strrchr);
++  CLOUDABI_INTERCEPT(strspn);
++  CLOUDABI_INTERCEPT(strcspn);
++  CLOUDABI_INTERCEPT(strpbrk);
++  CLOUDABI_INTERCEPT(memmove);
++  CLOUDABI_INTERCEPT(memchr);
++  CLOUDABI_INTERCEPT(memcmp);
++  CLOUDABI_INTERCEPT(memrchr);
++  CLOUDABI_INTERCEPT(memmem);
++  CLOUDABI_INTERCEPT(read);
++  CLOUDABI_INTERCEPT(fread);
++  CLOUDABI_INTERCEPT(pread);
++  CLOUDABI_INTERCEPT(readv);
++  CLOUDABI_INTERCEPT(sprintf);
++  CLOUDABI_INTERCEPT(vsprintf);
++  CLOUDABI_INTERCEPT(wcscat);
++  CLOUDABI_INTERCEPT(wcsncat);
++  CLOUDABI_INTERCEPT(strcat);
++  CLOUDABI_INTERCEPT(strcpy);
++  CLOUDABI_INTERCEPT(strncat);
++  CLOUDABI_INTERCEPT(preadv);
++  CLOUDABI_INTERCEPT(pwritev);
++  CLOUDABI_INTERCEPT(__cxa_atexit);
++  else {
++    char buf[128];
++    internal_snprintf(buf, sizeof(buf), "\nasan tried to intercept unimplemented real function \"%s\"\n", func_name);
++    cloudabi_debug(buf);
++
++    cloudabi_sys_proc_raise(CLOUDABI_SIGABRT);
++    cloudabi_sys_proc_exit(1);
++  }
++#undef CLOUDABI_INTERCEPT
++
++  return real == wrapper;
++}
++
++}  // namespace __interception
++
++#endif  // SANITIZER_CLOUDABI
+diff --git a/lib/interception/interception_linux.h b/lib/interception/interception_linux.h
+index 98fe51b..251abad 100644
+--- a/lib/interception/interception_linux.h
++++ b/lib/interception/interception_linux.h
+@@ -13,7 +13,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #if SANITIZER_LINUX || SANITIZER_FREEBSD || SANITIZER_NETBSD || \
+-    SANITIZER_SOLARIS
++    SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ 
+ #if !defined(INCLUDED_FROM_INTERCEPTION_LIB)
+ # error "interception_linux.h should be included from interception library only"
+@@ -35,16 +35,16 @@ void *GetFuncAddrVer(const char *func_name, const char *ver);
+       (::__interception::uptr) & (func),                                   \
+       (::__interception::uptr) & WRAP(func))
+ 
+-// Android and Solaris do not have dlvsym
+-#if !SANITIZER_ANDROID && !SANITIZER_SOLARIS
++// Android, Solaris and CloudABI do not have dlvsym
++#if !SANITIZER_ANDROID && !SANITIZER_SOLARIS && !SANITIZER_CLOUDABI
+ #define INTERCEPT_FUNCTION_VER_LINUX_OR_FREEBSD(func, symver) \
+   (::__interception::real_##func = (func##_f)(                \
+        unsigned long)::__interception::GetFuncAddrVer(#func, symver))
+ #else
+ #define INTERCEPT_FUNCTION_VER_LINUX_OR_FREEBSD(func, symver) \
+   INTERCEPT_FUNCTION_LINUX_OR_FREEBSD(func)
+-#endif  // !SANITIZER_ANDROID && !SANITIZER_SOLARIS
++#endif  // !SANITIZER_ANDROID && !SANITIZER_SOLARIS && !SANITIZER_CLOUDABI
+ 
+ #endif  // INTERCEPTION_LINUX_H
+ #endif  // SANITIZER_LINUX || SANITIZER_FREEBSD || SANITIZER_NETBSD ||
+-        // SANITIZER_SOLARIS
++        // SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+diff --git a/lib/interception/interception_type_test.cc b/lib/interception/interception_type_test.cc
+index 2b3a6d5..41c9e23 100644
+--- a/lib/interception/interception_type_test.cc
++++ b/lib/interception/interception_type_test.cc
+@@ -14,7 +14,7 @@
+ 
+ #include "interception.h"
+ 
+-#if SANITIZER_LINUX || SANITIZER_MAC
++#if SANITIZER_LINUX || SANITIZER_MAC || SANITIZER_CLOUDABI
+ 
+ #include <sys/types.h>
+ #include <stddef.h>
+@@ -25,7 +25,7 @@ COMPILER_CHECK(sizeof(::SSIZE_T) == sizeof(ssize_t));
+ COMPILER_CHECK(sizeof(::PTRDIFF_T) == sizeof(ptrdiff_t));
+ COMPILER_CHECK(sizeof(::INTMAX_T) == sizeof(intmax_t));
+ 
+-#if !SANITIZER_MAC
++#if !SANITIZER_MAC && !SANITIZER_CLOUDABI
+ COMPILER_CHECK(sizeof(::OFF64_T) == sizeof(off64_t));
+ #endif
+ 
+diff --git a/lib/sanitizer_common/CMakeLists.txt b/lib/sanitizer_common/CMakeLists.txt
+index e0226ae..662be95 100644
+--- a/lib/sanitizer_common/CMakeLists.txt
++++ b/lib/sanitizer_common/CMakeLists.txt
+@@ -3,6 +3,7 @@
+ 
+ set(SANITIZER_SOURCES_NOTERMINATION
+   sanitizer_allocator.cc
++  sanitizer_cloudabi.cc
+   sanitizer_common.cc
+   sanitizer_deadlock_detector1.cc
+   sanitizer_deadlock_detector2.cc
+@@ -28,6 +29,7 @@ set(SANITIZER_SOURCES_NOTERMINATION
+   sanitizer_procmaps_linux.cc
+   sanitizer_procmaps_mac.cc
+   sanitizer_procmaps_solaris.cc
++  sanitizer_procmaps_cloudabi.cc
+   sanitizer_solaris.cc
+   sanitizer_stackdepot.cc
+   sanitizer_stacktrace.cc
+diff --git a/lib/sanitizer_common/sanitizer_allocator_checks.h b/lib/sanitizer_common/sanitizer_allocator_checks.h
+index b61a8b2..42f4e5b 100644
+--- a/lib/sanitizer_common/sanitizer_allocator_checks.h
++++ b/lib/sanitizer_common/sanitizer_allocator_checks.h
+@@ -53,7 +53,7 @@ INLINE bool CheckAlignedAllocAlignmentAndSize(uptr alignment, uptr size) {
+ // Checks posix_memalign() parameters, verifies that alignment is a power of two
+ // and a multiple of sizeof(void *).
+ INLINE bool CheckPosixMemalignAlignment(uptr alignment) {
+-  return IsPowerOfTwo(alignment) && (alignment % sizeof(void *)) == 0; // NOLINT
++  return IsPowerOfTwo(alignment) && (alignment % sizeof(void *)) == 0 && alignment > sizeof(void*); // NOLINT
+ }
+ 
+ // Returns true if calloc(size, n) call overflows on size*n calculation.
+diff --git a/lib/sanitizer_common/sanitizer_cloudabi.cc b/lib/sanitizer_common/sanitizer_cloudabi.cc
+new file mode 100644
+index 0000000..f23b758
+--- /dev/null
++++ b/lib/sanitizer_common/sanitizer_cloudabi.cc
+@@ -0,0 +1,402 @@
++//===-- sanitizer_cloudabi.cc ---------------------------------------------===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is shared between AddressSanitizer and ThreadSanitizer
++// run-time libraries and implements CloudABI-specific functions from
++// sanitizer_libc.h.
++//===----------------------------------------------------------------------===//
++
++#include "sanitizer_platform.h"
++
++#if SANITIZER_CLOUDABI
++
++#include "sanitizer_common.h"
++#include "sanitizer_flags.h"
++#include "sanitizer_getauxval.h"
++#include "sanitizer_internal_defs.h"
++#include "sanitizer_libc.h"
++#include "sanitizer_linux.h"
++#include "sanitizer_mutex.h"
++#include "sanitizer_placement_new.h"
++#include "sanitizer_procmaps.h"
++#include "sanitizer_stacktrace.h"
++#include "sanitizer_symbolizer.h"
++
++#include <cloudabi_syscalls.h>
++#include <cloudlibc_interceptors.h>
++
++#include <dlfcn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <link.h>
++#include <pthread.h>
++#include <sched.h>
++#include <signal.h>
++#include <sys/mman.h>
++#include <sys/resource.h>
++#include <sys/stat.h>
++#include <sys/time.h>
++#include <sys/types.h>
++#include <sys/utsname.h>
++#include <unistd.h>
++
++// NOTE: The functions in this file are supposed to be used when the libc
++// should not be used, e.g. because of handling an error during a libc call.
++// So, they implement cloudlibc functions as cloudlibc does it. Be extra
++// careful when calling cloudlibc functions in these implementations.
++
++struct __clockid {
++  cloudabi_clockid_t id;
++};
++
++namespace __sanitizer {
++
++void cloudabi_mapping_added(void *addr, uptr length);
++void cloudabi_mapping_removed(void *addr, uptr length);
++
++// --------------- sanitizer_libc.h
++uptr internal_mmap(void *addr, uptr length, int prot, int flags, int fd,
++                   OFF_T offset) {
++  void *mapping;
++  cloudabi_errno_t error =
++    cloudabi_sys_mem_map(addr, length, prot, flags, fd, offset, &mapping);
++  if(error != 0) {
++    errno = error;
++    return 0;
++  }
++  cloudabi_mapping_added(mapping, length);
++  return (uptr)mapping;
++}
++
++uptr internal_munmap(void *addr, uptr length) {
++  cloudabi_errno_t error = cloudabi_sys_mem_unmap(addr, length);
++  if (error != 0) {
++    errno = error;
++    return -1;
++  }
++  cloudabi_mapping_removed(addr, length);
++  return 0;
++}
++
++int internal_mprotect(void *addr, uptr length, int prot) {
++  cloudabi_errno_t error = cloudabi_sys_mem_protect(addr, length, prot);
++  if (error != 0) {
++    errno = error;
++    return -1;
++  }
++  return 0;
++}
++
++uptr internal_close(fd_t fd) {
++  cloudabi_errno_t error = cloudabi_sys_fd_close(fd);
++  if (error != 0) {
++    errno = error;
++    return -1;
++  }
++  return 0;
++}
++
++uptr internal_read(fd_t fd, void *buf, uptr count) {
++  cloudabi_iovec_t iov = {.buf = buf, .buf_len = count};
++  size_t bytes_read;
++  cloudabi_errno_t error = cloudabi_sys_fd_read(fd, &iov, 1, &bytes_read);
++  if (error != 0) {
++    errno = error == ENOTCAPABLE ? EBADF : error;
++    return -1;
++  }
++  return bytes_read;
++}
++
++uptr internal_write(fd_t fd, const void *buf, uptr count) {
++  cloudabi_ciovec_t iov = {.buf = buf, .buf_len = count};
++  size_t bytes_written;
++  cloudabi_errno_t error =
++      cloudabi_sys_fd_write(fd, &iov, 1, &bytes_written);
++  if (error != 0) {
++    errno = error == ENOTCAPABLE ? EBADF : error;
++    return -1;
++  }
++  return bytes_written;
++}
++
++#define NSEC_PER_SEC 1000000000
++
++static inline struct timespec timestamp_to_timespec(
++    cloudabi_timestamp_t timestamp) {
++  // Decompose timestamp into seconds and nanoseconds.
++  return (struct timespec){.tv_sec = (__time_t)(timestamp / NSEC_PER_SEC),
++                           .tv_nsec = (long)(timestamp % NSEC_PER_SEC)};
++}
++
++static inline void to_public_stat(const cloudabi_filestat_t *in,
++                                  struct stat *out) {
++  // Ensure that we don't truncate any values.
++  static_assert(sizeof(in->st_dev) == sizeof(out->st_dev), "Size mismatch");
++  static_assert(sizeof(in->st_ino) == sizeof(out->st_ino), "Size mismatch");
++  static_assert(sizeof(in->st_filetype) == sizeof(out->__st_filetype),
++                "Size mismatch");
++  static_assert(sizeof(in->st_nlink) == sizeof(out->st_nlink), "Size mismatch");
++  static_assert(sizeof(in->st_size) == sizeof(out->st_size), "Size mismatch");
++
++  *out = (struct stat){
++#define COPY_FIELD(field) .field = in->field
++      COPY_FIELD(st_dev),
++      COPY_FIELD(st_ino),
++      .__st_filetype = in->st_filetype,
++      COPY_FIELD(st_nlink),
++      .st_size = (off_t)in->st_size,
++#undef COPY_FIELD
++#define COPY_TIMESPEC(field) .field = timestamp_to_timespec(in->field)
++      COPY_TIMESPEC(st_atim),
++      COPY_TIMESPEC(st_mtim),
++      COPY_TIMESPEC(st_ctim),
++#undef COPY_TIMESPEC
++  };
++
++  // Convert file type to legacy types encoded in st_mode.
++  switch (in->st_filetype) {
++    case CLOUDABI_FILETYPE_BLOCK_DEVICE:
++      out->st_mode |= S_IFBLK;
++      break;
++    case CLOUDABI_FILETYPE_CHARACTER_DEVICE:
++      out->st_mode |= S_IFCHR;
++      break;
++    case CLOUDABI_FILETYPE_DIRECTORY:
++      out->st_mode |= S_IFDIR;
++      break;
++    case CLOUDABI_FILETYPE_REGULAR_FILE:
++      out->st_mode |= S_IFREG;
++      break;
++    case CLOUDABI_FILETYPE_SOCKET_DGRAM:
++    case CLOUDABI_FILETYPE_SOCKET_STREAM:
++      out->st_mode |= S_IFSOCK;
++      break;
++    case CLOUDABI_FILETYPE_SYMBOLIC_LINK:
++      out->st_mode |= S_IFLNK;
++      break;
++  }
++}
++
++uptr internal_fstat(fd_t fd, void *buf) {
++  cloudabi_filestat_t fstat;
++  cloudabi_errno_t error = cloudabi_sys_file_stat_fget(fd, &fstat);
++  if (error != 0) {
++    errno = error;
++    return -1;
++  }
++  to_public_stat(&fstat, (struct stat *)buf);
++  return 0;
++}
++
++uptr internal_filesize(fd_t fd) {
++  struct stat st;
++  if (internal_fstat(fd, &st))
++    return -1;
++  return (uptr)st.st_size;
++}
++
++uptr internal_dup2(int oldfd, int newfd) {
++  cloudabi_errno_t error = cloudabi_sys_fd_replace(oldfd, newfd);
++  if (error != 0) {
++    errno = error;
++    return -1;
++  }
++  return newfd;
++}
++
++uptr internal_sched_yield() {
++  cloudabi_errno_t error = cloudabi_sys_thread_yield();
++  if (error != 0) {
++    errno = error;
++    return -1;
++  }
++  return 0;
++}
++
++void internal__exit(int exitcode) {
++  cloudabi_sys_proc_exit(exitcode);
++  Die();  // Unreachable.
++}
++
++tid_t GetTid() {
++  return (uptr)pthread_self();
++}
++
++#define NSEC_PER_SEC 1000000000
++
++uptr internal_clock_gettime(__sanitizer_clockid_t clk_id, void *tp) {
++  cloudabi_timestamp_t ts;
++  cloudabi_errno_t error = cloudabi_sys_clock_time_get(clk_id->id, 1, &ts);
++  if (error != 0) {
++    errno = error;
++    return -1;
++  }
++  struct timespec *tx = (struct timespec*)tp;
++  *tx = timestamp_to_timespec(ts);
++  return 0;
++}
++
++const char *GetEnv(const char *name) {
++  // no environment on CloudABI
++  return nullptr;
++}
++
++extern "C" {
++  SANITIZER_WEAK_ATTRIBUTE extern void *__libc_stack_end;
++}
++
++static void GetArgsAndEnv(char ***argv, char ***envp) {
++  // No env or argv.
++  *argv = nullptr;
++  *envp = nullptr;
++}
++
++char **GetArgv() {
++  char **argv, **envp;
++  GetArgsAndEnv(&argv, &envp);
++  return argv;
++}
++
++enum MutexState {
++  MtxUnlocked = 0,
++  MtxLocked = 1,
++  MtxSleeping = 2
++};
++
++BlockingMutex::BlockingMutex() {
++  internal_memset(this, 0, sizeof(*this));
++  CHECK(sizeof(pthread_mutex_t) <= sizeof(opaque_storage_));
++  pthread_mutex_init((pthread_mutex_t*)opaque_storage_, NULL);
++}
++
++void BlockingMutex::Lock() {
++  CHECK_EQ(owner_, 0);
++  __cloudlibc_pthread_mutex_lock((pthread_mutex_t*)opaque_storage_);
++}
++
++void BlockingMutex::Unlock() {
++  __cloudlibc_pthread_mutex_unlock((pthread_mutex_t*)opaque_storage_);
++}
++
++void BlockingMutex::CheckLocked() {
++  if (pthread_mutex_trylock((pthread_mutex_t*)opaque_storage_) != EBUSY) {
++    Report("CheckLocked: mutex is not locked!");
++    Die();
++  }
++}
++
++#if SANITIZER_WORDSIZE == 32
++// Take care of unusable kernel area in top gigabyte.
++static uptr GetKernelAreaSize() {
++  const uptr gbyte = 1UL << 30;
++
++  // Firstly check if there are writable segments
++  // mapped to top gigabyte (e.g. stack).
++  MemoryMappingLayout proc_maps(/*cache_enabled*/true);
++  MemoryMappedSegment segment;
++  while (proc_maps.Next(&segment)) {
++    if ((segment.end >= 3 * gbyte) && segment.IsWritable()) return 0;
++  }
++
++  // Top gigabyte is reserved for kernel.
++  return gbyte;
++}
++#endif  // SANITIZER_WORDSIZE == 32
++
++uptr GetMaxVirtualAddress() {
++#if SANITIZER_WORDSIZE == 64
++# if defined(__powerpc64__) || defined(__aarch64__)
++  // On PowerPC64 we have two different address space layouts: 44- and 46-bit.
++  // We somehow need to figure out which one we are using now and choose
++  // one of 0x00000fffffffffffUL and 0x00003fffffffffffUL.
++  // Note that with 'ulimit -s unlimited' the stack is moved away from the top
++  // of the address space, so simply checking the stack address is not enough.
++  // This should (does) work for both PowerPC64 Endian modes.
++  // Similarly, aarch64 has multiple address space layouts: 39, 42 and 47-bit.
++  return (1ULL << (MostSignificantSetBitIndex(GET_CURRENT_FRAME()) + 1)) - 1;
++# elif defined(__mips64)
++  return (1ULL << 40) - 1;  // 0x000000ffffffffffUL;
++# elif defined(__s390x__)
++  return (1ULL << 53) - 1;  // 0x001fffffffffffffUL;
++# else
++  return (1ULL << 47) - 1;  // 0x00007fffffffffffUL;
++# endif
++#else  // SANITIZER_WORDSIZE == 32
++# if defined(__s390__)
++  return (1ULL << 31) - 1;  // 0x7fffffff;
++# else
++  return (1ULL << 32) - 1;  // 0xffffffff;
++# endif
++#endif  // SANITIZER_WORDSIZE
++}
++
++uptr GetMaxUserVirtualAddress() {
++  uptr addr = GetMaxVirtualAddress();
++#if SANITIZER_WORDSIZE == 32 && !defined(__s390__)
++  if (!common_flags()->full_address_space)
++    addr -= GetKernelAreaSize();
++  CHECK_LT(reinterpret_cast<uptr>(&addr), addr);
++#endif
++  return addr;
++}
++
++uptr GetPageSize() {
++  return sysconf(_SC_PAGESIZE);
++}
++
++uptr ReadBinaryName(/*out*/char *buf, uptr buf_len) {
++  // We don't know, read in a constant
++  internal_strncpy(buf, "cloudabi_binary", buf_len);
++  buf[buf_len] = 0;
++  return internal_strnlen(buf, buf_len);
++}
++
++uptr ReadLongProcessName(/*out*/ char *buf, uptr buf_len) {
++  return ReadBinaryName(buf, buf_len);
++}
++
++// Match full names of the form /path/to/base_name{-,.}*
++bool LibraryNameIs(const char *full_name, const char *base_name) {
++  const char *name = full_name;
++  // Strip path.
++  while (*name != '\0') name++;
++  while (name > full_name && *name != '/') name--;
++  if (*name == '/') name++;
++  uptr base_name_length = internal_strlen(base_name);
++  if (internal_strncmp(name, base_name, base_name_length)) return false;
++  return (name[base_name_length] == '-' || name[base_name_length] == '.');
++}
++
++void PrintModuleMap() { }
++
++bool GetRandom(void *buffer, uptr length, bool blocking) {
++  if (!buffer || !length || length > 256)
++    return false;
++  cloudabi_errno_t error =
++    cloudabi_sys_random_get(buffer, length);
++  if (error != 0) {
++    errno = error;
++    return false;
++  }
++  return true;
++}
++
++bool internal_iserror(uptr retval, int *rverrno) {
++  if (retval == (uptr)-1) {
++    if (rverrno)
++      *rverrno = errno;
++    return true;
++  } else {
++    return false;
++  }
++}
++
++} // namespace __sanitizer
++
++#endif  // SANITIZER_CLOUDABI
+diff --git a/lib/sanitizer_common/sanitizer_common.h b/lib/sanitizer_common/sanitizer_common.h
+index 1fbaee7..ef2339a 100644
+--- a/lib/sanitizer_common/sanitizer_common.h
++++ b/lib/sanitizer_common/sanitizer_common.h
+@@ -845,6 +845,7 @@ static inline void SanitizerBreakOptimization(void *arg) {
+ #endif
+ }
+ 
++#if !SANIITZER_CLOUDABI
+ struct SignalContext {
+   void *siginfo;
+   void *context;
+@@ -891,6 +892,7 @@ struct SignalContext {
+ };
+ 
+ void MaybeReexec();
++#endif
+ 
+ template <typename Fn>
+ class RunOnDestruction {
+diff --git a/lib/sanitizer_common/sanitizer_common_interceptors.inc b/lib/sanitizer_common/sanitizer_common_interceptors.inc
+index 3234268..4023635 100644
+--- a/lib/sanitizer_common/sanitizer_common_interceptors.inc
++++ b/lib/sanitizer_common/sanitizer_common_interceptors.inc
+@@ -1198,7 +1198,11 @@ INTERCEPTOR(int, prctl, int option, unsigned long arg2,
+ #endif  // SANITIZER_INTERCEPT_PRCTL
+ 
+ #if SANITIZER_INTERCEPT_TIME
++#if !SANITIZER_CLOUDABI
+ INTERCEPTOR(unsigned long, time, unsigned long *t) {
++#else
++INTERCEPTOR(time_t, time, time_t *t) {
++#endif
+   void *ctx;
+   COMMON_INTERCEPTOR_ENTER(ctx, time, t);
+   unsigned long local_t;
+@@ -1370,7 +1374,7 @@ INTERCEPTOR(char *, strptime, char *s, char *format, __sanitizer_tm *tm) {
+ #define INIT_STRPTIME
+ #endif
+ 
+-#if SANITIZER_INTERCEPT_SCANF || SANITIZER_INTERCEPT_PRINTF
++#if SANITIZER_INTERCEPT_SCANF || SANITIZER_INTERCEPT_FSCANF || SANITIZER_INTERCEPT_PRINTF || SANITIZER_INTERCEPT_FPRINTF
+ #include "sanitizer_common_interceptors_format.inc"
+ 
+ #define FORMAT_INTERCEPTOR_IMPL(name, vname, ...)                              \
+@@ -1386,7 +1390,7 @@ INTERCEPTOR(char *, strptime, char *s, char *format, __sanitizer_tm *tm) {
+ 
+ #endif
+ 
+-#if SANITIZER_INTERCEPT_SCANF
++#if SANITIZER_INTERCEPT_SCANF || SANITIZER_INTERCEPT_FSCANF
+ 
+ #define VSCANF_INTERCEPTOR_IMPL(vname, allowGnuMalloc, ...)                    \
+   {                                                                            \
+@@ -1401,15 +1405,28 @@ INTERCEPTOR(char *, strptime, char *s, char *format, __sanitizer_tm *tm) {
+     return res;                                                                \
+   }
+ 
++#if SANITIZER_INTERCEPT_SCANF
+ INTERCEPTOR(int, vscanf, const char *format, va_list ap)
+ VSCANF_INTERCEPTOR_IMPL(vscanf, true, format, ap)
+ 
++INTERCEPTOR(int, scanf, const char *format, ...)
++FORMAT_INTERCEPTOR_IMPL(scanf, vscanf, format)
++#endif
++
++#if SANITIZER_INTERCEPT_FSCANF
+ INTERCEPTOR(int, vsscanf, const char *str, const char *format, va_list ap)
+ VSCANF_INTERCEPTOR_IMPL(vsscanf, true, str, format, ap)
+ 
+ INTERCEPTOR(int, vfscanf, void *stream, const char *format, va_list ap)
+ VSCANF_INTERCEPTOR_IMPL(vfscanf, true, stream, format, ap)
+ 
++INTERCEPTOR(int, fscanf, void *stream, const char *format, ...)
++FORMAT_INTERCEPTOR_IMPL(fscanf, vfscanf, stream, format)
++
++INTERCEPTOR(int, sscanf, const char *str, const char *format, ...)
++FORMAT_INTERCEPTOR_IMPL(sscanf, vsscanf, str, format)
++#endif
++
+ #if SANITIZER_INTERCEPT_ISOC99_SCANF
+ INTERCEPTOR(int, __isoc99_vscanf, const char *format, va_list ap)
+ VSCANF_INTERCEPTOR_IMPL(__isoc99_vscanf, false, format, ap)
+@@ -1420,18 +1437,7 @@ VSCANF_INTERCEPTOR_IMPL(__isoc99_vsscanf, false, str, format, ap)
+ 
+ INTERCEPTOR(int, __isoc99_vfscanf, void *stream, const char *format, va_list ap)
+ VSCANF_INTERCEPTOR_IMPL(__isoc99_vfscanf, false, stream, format, ap)
+-#endif  // SANITIZER_INTERCEPT_ISOC99_SCANF
+-
+-INTERCEPTOR(int, scanf, const char *format, ...)
+-FORMAT_INTERCEPTOR_IMPL(scanf, vscanf, format)
+ 
+-INTERCEPTOR(int, fscanf, void *stream, const char *format, ...)
+-FORMAT_INTERCEPTOR_IMPL(fscanf, vfscanf, stream, format)
+-
+-INTERCEPTOR(int, sscanf, const char *str, const char *format, ...)
+-FORMAT_INTERCEPTOR_IMPL(sscanf, vsscanf, str, format)
+-
+-#if SANITIZER_INTERCEPT_ISOC99_SCANF
+ INTERCEPTOR(int, __isoc99_scanf, const char *format, ...)
+ FORMAT_INTERCEPTOR_IMPL(__isoc99_scanf, __isoc99_vscanf, format)
+ 
+@@ -1444,15 +1450,21 @@ FORMAT_INTERCEPTOR_IMPL(__isoc99_sscanf, __isoc99_vsscanf, str, format)
+ 
+ #endif
+ 
+-#if SANITIZER_INTERCEPT_SCANF
+-#define INIT_SCANF                    \
+-  COMMON_INTERCEPT_FUNCTION_LDBL(scanf);   \
++#if SANITIZER_INTERCEPT_FSCANF
++#define INIT_FSCANF                   \
+   COMMON_INTERCEPT_FUNCTION_LDBL(sscanf);  \
+   COMMON_INTERCEPT_FUNCTION_LDBL(fscanf);  \
+-  COMMON_INTERCEPT_FUNCTION_LDBL(vscanf);  \
+   COMMON_INTERCEPT_FUNCTION_LDBL(vsscanf); \
+   COMMON_INTERCEPT_FUNCTION_LDBL(vfscanf);
+ #else
++#define INIT_FSCANF
++#endif
++
++#if SANITIZER_INTERCEPT_SCANF
++#define INIT_SCANF                    \
++  COMMON_INTERCEPT_FUNCTION_LDBL(scanf);   \
++  COMMON_INTERCEPT_FUNCTION_LDBL(vscanf);
++#else
+ #define INIT_SCANF
+ #endif
+ 
+@@ -1468,7 +1480,7 @@ FORMAT_INTERCEPTOR_IMPL(__isoc99_sscanf, __isoc99_vsscanf, str, format)
+ #define INIT_ISOC99_SCANF
+ #endif
+ 
+-#if SANITIZER_INTERCEPT_PRINTF
++#if SANITIZER_INTERCEPT_PRINTF || SANITIZER_INTERCEPT_FPRINTF
+ 
+ #define VPRINTF_INTERCEPTOR_ENTER(vname, ...)                                  \
+   void *ctx;                                                                   \
+@@ -1541,9 +1553,15 @@ FORMAT_INTERCEPTOR_IMPL(__isoc99_sscanf, __isoc99_vsscanf, str, format)
+     return res;                                                                \
+   }
+ 
++#if SANITIZER_INTERCEPT_PRINTF
+ INTERCEPTOR(int, vprintf, const char *format, va_list ap)
+ VPRINTF_INTERCEPTOR_IMPL(vprintf, format, ap)
+ 
++INTERCEPTOR(int, printf, const char *format, ...)
++FORMAT_INTERCEPTOR_IMPL(printf, vprintf, format)
++#endif
++
++#if SANITIZER_INTERCEPT_FPRINTF
+ INTERCEPTOR(int, vfprintf, __sanitizer_FILE *stream, const char *format,
+             va_list ap)
+ VPRINTF_INTERCEPTOR_IMPL(vfprintf, stream, format, ap)
+@@ -1552,6 +1570,25 @@ INTERCEPTOR(int, vsnprintf, char *str, SIZE_T size, const char *format,
+             va_list ap)
+ VSNPRINTF_INTERCEPTOR_IMPL(vsnprintf, str, size, format, ap)
+ 
++INTERCEPTOR(int, vsprintf, char *str, const char *format, va_list ap)
++VSPRINTF_INTERCEPTOR_IMPL(vsprintf, str, format, ap)
++
++INTERCEPTOR(int, vasprintf, char **strp, const char *format, va_list ap)
++VASPRINTF_INTERCEPTOR_IMPL(vasprintf, strp, format, ap)
++
++INTERCEPTOR(int, fprintf, __sanitizer_FILE *stream, const char *format, ...)
++FORMAT_INTERCEPTOR_IMPL(fprintf, vfprintf, stream, format)
++
++INTERCEPTOR(int, sprintf, char *str, const char *format, ...) // NOLINT
++FORMAT_INTERCEPTOR_IMPL(sprintf, vsprintf, str, format) // NOLINT
++
++INTERCEPTOR(int, snprintf, char *str, SIZE_T size, const char *format, ...)
++FORMAT_INTERCEPTOR_IMPL(snprintf, vsnprintf, str, size, format)
++
++INTERCEPTOR(int, asprintf, char **strp, const char *format, ...)
++FORMAT_INTERCEPTOR_IMPL(asprintf, vasprintf, strp, format)
++#endif
++
+ #if SANITIZER_INTERCEPT___PRINTF_CHK
+ INTERCEPTOR(int, __vsnprintf_chk, char *str, SIZE_T size, int flag,
+             SIZE_T size_to, const char *format, va_list ap)
+@@ -1568,18 +1605,12 @@ INTERCEPTOR(int, snprintf_l, char *str, SIZE_T size, void *loc,
+ FORMAT_INTERCEPTOR_IMPL(snprintf_l, vsnprintf_l, str, size, loc, format)
+ #endif  // SANITIZER_INTERCEPT_PRINTF_L
+ 
+-INTERCEPTOR(int, vsprintf, char *str, const char *format, va_list ap)
+-VSPRINTF_INTERCEPTOR_IMPL(vsprintf, str, format, ap)
+-
+ #if SANITIZER_INTERCEPT___PRINTF_CHK
+ INTERCEPTOR(int, __vsprintf_chk, char *str, int flag, SIZE_T size_to,
+             const char *format, va_list ap)
+ VSPRINTF_INTERCEPTOR_IMPL(vsprintf, str, format, ap)
+ #endif
+ 
+-INTERCEPTOR(int, vasprintf, char **strp, const char *format, va_list ap)
+-VASPRINTF_INTERCEPTOR_IMPL(vasprintf, strp, format, ap)
+-
+ #if SANITIZER_INTERCEPT_ISOC99_PRINTF
+ INTERCEPTOR(int, __isoc99_vprintf, const char *format, va_list ap)
+ VPRINTF_INTERCEPTOR_IMPL(__isoc99_vprintf, format, ap)
+@@ -1599,39 +1630,24 @@ VSPRINTF_INTERCEPTOR_IMPL(__isoc99_vsprintf, str, format,
+ 
+ #endif  // SANITIZER_INTERCEPT_ISOC99_PRINTF
+ 
+-INTERCEPTOR(int, printf, const char *format, ...)
+-FORMAT_INTERCEPTOR_IMPL(printf, vprintf, format)
+-
+-INTERCEPTOR(int, fprintf, __sanitizer_FILE *stream, const char *format, ...)
+-FORMAT_INTERCEPTOR_IMPL(fprintf, vfprintf, stream, format)
+-
+ #if SANITIZER_INTERCEPT___PRINTF_CHK
+ INTERCEPTOR(int, __fprintf_chk, __sanitizer_FILE *stream, SIZE_T size,
+             const char *format, ...)
+ FORMAT_INTERCEPTOR_IMPL(__fprintf_chk, vfprintf, stream, format)
+ #endif
+ 
+-INTERCEPTOR(int, sprintf, char *str, const char *format, ...) // NOLINT
+-FORMAT_INTERCEPTOR_IMPL(sprintf, vsprintf, str, format) // NOLINT
+-
+ #if SANITIZER_INTERCEPT___PRINTF_CHK
+ INTERCEPTOR(int, __sprintf_chk, char *str, int flag, SIZE_T size_to,
+             const char *format, ...) // NOLINT
+ FORMAT_INTERCEPTOR_IMPL(__sprintf_chk, vsprintf, str, format) // NOLINT
+ #endif
+ 
+-INTERCEPTOR(int, snprintf, char *str, SIZE_T size, const char *format, ...)
+-FORMAT_INTERCEPTOR_IMPL(snprintf, vsnprintf, str, size, format)
+-
+ #if SANITIZER_INTERCEPT___PRINTF_CHK
+ INTERCEPTOR(int, __snprintf_chk, char *str, SIZE_T size, int flag,
+             SIZE_T size_to, const char *format, ...) // NOLINT
+ FORMAT_INTERCEPTOR_IMPL(__snprintf_chk, vsnprintf, str, size, format) // NOLINT
+ #endif
+ 
+-INTERCEPTOR(int, asprintf, char **strp, const char *format, ...)
+-FORMAT_INTERCEPTOR_IMPL(asprintf, vasprintf, strp, format)
+-
+ #if SANITIZER_INTERCEPT_ISOC99_PRINTF
+ INTERCEPTOR(int, __isoc99_printf, const char *format, ...)
+ FORMAT_INTERCEPTOR_IMPL(__isoc99_printf, __isoc99_vprintf, format)
+@@ -1650,21 +1666,27 @@ FORMAT_INTERCEPTOR_IMPL(__isoc99_snprintf, __isoc99_vsnprintf, str, size,
+ 
+ #endif  // SANITIZER_INTERCEPT_ISOC99_PRINTF
+ 
+-#endif  // SANITIZER_INTERCEPT_PRINTF
++#endif  // SANITIZER_INTERCEPT_PRINTF || SANITIZER_INTERCEPT_FPRINTF
+ 
+-#if SANITIZER_INTERCEPT_PRINTF
+-#define INIT_PRINTF                     \
+-  COMMON_INTERCEPT_FUNCTION_LDBL(printf);    \
++#if SANITIZER_INTERCEPT_FPRINTF
++#define INIT_FPRINTF                    \
+   COMMON_INTERCEPT_FUNCTION_LDBL(sprintf);   \
+   COMMON_INTERCEPT_FUNCTION_LDBL(snprintf);  \
+   COMMON_INTERCEPT_FUNCTION_LDBL(asprintf);  \
+   COMMON_INTERCEPT_FUNCTION_LDBL(fprintf);   \
+-  COMMON_INTERCEPT_FUNCTION_LDBL(vprintf);   \
+   COMMON_INTERCEPT_FUNCTION_LDBL(vsprintf);  \
+   COMMON_INTERCEPT_FUNCTION_LDBL(vsnprintf); \
+   COMMON_INTERCEPT_FUNCTION_LDBL(vasprintf); \
+   COMMON_INTERCEPT_FUNCTION_LDBL(vfprintf);
+ #else
++#define INIT_FPRINTF
++#endif
++
++#if SANITIZER_INTERCEPT_PRINTF
++#define INIT_PRINTF                     \
++  COMMON_INTERCEPT_FUNCTION_LDBL(printf);    \
++  COMMON_INTERCEPT_FUNCTION_LDBL(vprintf);
++#else
+ #define INIT_PRINTF
+ #endif
+ 
+@@ -2064,7 +2086,11 @@ INTERCEPTOR(void, endgrent, int dummy) {
+ #endif
+ 
+ #if SANITIZER_INTERCEPT_CLOCK_GETTIME
++#if !SANITIZER_CLOUDABI
+ INTERCEPTOR(int, clock_getres, u32 clk_id, void *tp) {
++#else
++INTERCEPTOR(int, clock_getres, clockid_t clk_id, struct timespec *tp) {
++#endif
+   void *ctx;
+   COMMON_INTERCEPTOR_ENTER(ctx, clock_getres, clk_id, tp);
+   // FIXME: under ASan the call below may write to freed memory and corrupt
+@@ -2076,7 +2102,12 @@ INTERCEPTOR(int, clock_getres, u32 clk_id, void *tp) {
+   }
+   return res;
+ }
++
++#if !SANITIZER_CLOUDABI
+ INTERCEPTOR(int, clock_gettime, u32 clk_id, void *tp) {
++#else
++INTERCEPTOR(int, clock_gettime, clockid_t clk_id, struct timespec *tp) {
++#endif
+   void *ctx;
+   COMMON_INTERCEPTOR_ENTER(ctx, clock_gettime, clk_id, tp);
+   // FIXME: under ASan the call below may write to freed memory and corrupt
+@@ -2091,22 +2122,28 @@ INTERCEPTOR(int, clock_gettime, u32 clk_id, void *tp) {
+ namespace __sanitizer {
+ extern "C" {
+ int real_clock_gettime(u32 clk_id, void *tp) {
+-  return REAL(clock_gettime)(clk_id, tp);
++  return REAL(clock_gettime)(reinterpret_cast<clockid_t>(clk_id), (struct timespec*)tp);
+ }
+ }  // extern "C"
+ }  // namespace __sanitizer
++#define INIT_CLOCK_GETTIME                  \
++  COMMON_INTERCEPT_FUNCTION(clock_getres);  \
++  COMMON_INTERCEPT_FUNCTION(clock_gettime);
++#else
++#define INIT_CLOCK_GETTIME
++#endif
++
++#if SANITIZER_INTERCEPT_CLOCK_SETTIME
+ INTERCEPTOR(int, clock_settime, u32 clk_id, const void *tp) {
+   void *ctx;
+   COMMON_INTERCEPTOR_ENTER(ctx, clock_settime, clk_id, tp);
+   COMMON_INTERCEPTOR_READ_RANGE(ctx, tp, struct_timespec_sz);
+   return REAL(clock_settime)(clk_id, tp);
+ }
+-#define INIT_CLOCK_GETTIME                  \
+-  COMMON_INTERCEPT_FUNCTION(clock_getres);  \
+-  COMMON_INTERCEPT_FUNCTION(clock_gettime); \
++#define INIT_CLOCK_SETTIME                  \
+   COMMON_INTERCEPT_FUNCTION(clock_settime);
+ #else
+-#define INIT_CLOCK_GETTIME
++#define INIT_CLOCK_SETTIME
+ #endif
+ 
+ #if SANITIZER_INTERCEPT_GETITIMER
+@@ -2951,7 +2988,7 @@ INTERCEPTOR(int, sysinfo, void *info) {
+ #define INIT_SYSINFO
+ #endif
+ 
+-#if SANITIZER_INTERCEPT_READDIR
++#if SANITIZER_INTERCEPT_OPENDIR
+ INTERCEPTOR(__sanitizer_dirent *, opendir, const char *path) {
+   void *ctx;
+   COMMON_INTERCEPTOR_ENTER(ctx, opendir, path);
+@@ -2961,7 +2998,13 @@ INTERCEPTOR(__sanitizer_dirent *, opendir, const char *path) {
+     COMMON_INTERCEPTOR_DIR_ACQUIRE(ctx, path);
+   return res;
+ }
++#define INIT_OPENDIR                  \
++  COMMON_INTERCEPT_FUNCTION(opendir);
++#else
++#define INIT_OPENDIR
++#endif
+ 
++#if SANITIZER_INTERCEPT_READDIR
+ INTERCEPTOR(__sanitizer_dirent *, readdir, void *dirp) {
+   void *ctx;
+   COMMON_INTERCEPTOR_ENTER(ctx, readdir, dirp);
+@@ -2969,10 +3012,20 @@ INTERCEPTOR(__sanitizer_dirent *, readdir, void *dirp) {
+   // its metadata. See
+   // https://github.com/google/sanitizers/issues/321.
+   __sanitizer_dirent *res = REAL(readdir)(dirp);
++#if !SANITIZER_CLOUDABI
+   if (res) COMMON_INTERCEPTOR_WRITE_RANGE(ctx, res, res->d_reclen);
++#else
++  if (res) COMMON_INTERCEPTOR_WRITE_RANGE(ctx, res, strlen(res->d_name));
++#endif
+   return res;
+ }
++#define INIT_READDIR                  \
++  COMMON_INTERCEPT_FUNCTION(readdir);
++#else
++#define INIT_READDIR
++#endif
+ 
++#if SANITIZER_INTERCEPT_READDIR_R
+ INTERCEPTOR(int, readdir_r, void *dirp, __sanitizer_dirent *entry,
+             __sanitizer_dirent **result) {
+   void *ctx;
+@@ -2989,12 +3042,10 @@ INTERCEPTOR(int, readdir_r, void *dirp, __sanitizer_dirent *entry,
+   return res;
+ }
+ 
+-#define INIT_READDIR                  \
+-  COMMON_INTERCEPT_FUNCTION(opendir); \
+-  COMMON_INTERCEPT_FUNCTION(readdir); \
++#define INIT_READDIR_R                \
+   COMMON_INTERCEPT_FUNCTION(readdir_r);
+ #else
+-#define INIT_READDIR
++#define INIT_READDIR_R
+ #endif
+ 
+ #if SANITIZER_INTERCEPT_READDIR64
+@@ -3485,7 +3536,7 @@ INTERCEPTOR(char *, strerror, int errnum) {
+ //  * GNU version returns message pointer, which points to either buf or some
+ //    static storage.
+ #if ((_POSIX_C_SOURCE >= 200112L || _XOPEN_SOURCE >= 600) && !_GNU_SOURCE) || \
+-    SANITIZER_MAC || SANITIZER_ANDROID || SANITIZER_NETBSD
++    SANITIZER_MAC || SANITIZER_ANDROID || SANITIZER_NETBSD || SANITIZER_CLOUDABI
+ // POSIX version. Spec is not clear on whether buf is NULL-terminated.
+ // At least on OSX, buf contents are valid even when the call fails.
+ INTERCEPTOR(int, strerror_r, int errnum, char *buf, SIZE_T buflen) {
+@@ -3584,8 +3635,13 @@ INTERCEPTOR(int, scandir, char *dirp, __sanitizer_dirent ***namelist,
+     COMMON_INTERCEPTOR_WRITE_RANGE(ctx, namelist, sizeof(*namelist));
+     COMMON_INTERCEPTOR_WRITE_RANGE(ctx, *namelist, sizeof(**namelist) * res);
+     for (int i = 0; i < res; ++i)
++#if !SANITIZER_CLOUDABI
+       COMMON_INTERCEPTOR_WRITE_RANGE(ctx, (*namelist)[i],
+                                      (*namelist)[i]->d_reclen);
++#else
++      COMMON_INTERCEPTOR_WRITE_RANGE(ctx, (*namelist)[i],
++                                     strlen((*namelist)[i]->d_name));
++#endif
+   }
+   return res;
+ }
+@@ -4644,7 +4700,11 @@ INTERCEPTOR(long double, remquol, long double x, long double y, int *quo) {
+ #endif
+ 
+ #if SANITIZER_INTERCEPT_LGAMMA
++#if SANITIZER_CLOUDABI
++int signgam;
++#else
+ extern int signgam;
++#endif
+ INTERCEPTOR(double, lgamma, double x) {
+   void *ctx;
+   COMMON_INTERCEPTOR_ENTER(ctx, lgamma, x);
+@@ -5453,7 +5513,7 @@ INTERCEPTOR(void *, tsearch, void *key, void **rootp,
+ #endif
+ 
+ #if SANITIZER_INTERCEPT_LIBIO_INTERNALS || SANITIZER_INTERCEPT_FOPEN || \
+-    SANITIZER_INTERCEPT_OPEN_MEMSTREAM
++    SANITIZER_INTERCEPT_FDOPEN || SANITIZER_INTERCEPT_OPEN_MEMSTREAM
+ void unpoison_file(__sanitizer_FILE *fp) {
+ #if SANITIZER_HAS_STRUCT_FILE
+   COMMON_INTERCEPTOR_INITIALIZE_RANGE(fp, sizeof(*fp));
+@@ -5530,14 +5590,6 @@ INTERCEPTOR(__sanitizer_FILE *, fopen, const char *path, const char *mode) {
+   if (res) unpoison_file(res);
+   return res;
+ }
+-INTERCEPTOR(__sanitizer_FILE *, fdopen, int fd, const char *mode) {
+-  void *ctx;
+-  COMMON_INTERCEPTOR_ENTER(ctx, fdopen, fd, mode);
+-  COMMON_INTERCEPTOR_READ_RANGE(ctx, mode, REAL(strlen)(mode) + 1);
+-  __sanitizer_FILE *res = REAL(fdopen)(fd, mode);
+-  if (res) unpoison_file(res);
+-  return res;
+-}
+ INTERCEPTOR(__sanitizer_FILE *, freopen, const char *path, const char *mode,
+             __sanitizer_FILE *fp) {
+   void *ctx;
+@@ -5552,12 +5604,26 @@ INTERCEPTOR(__sanitizer_FILE *, freopen, const char *path, const char *mode,
+ }
+ #define INIT_FOPEN                   \
+   COMMON_INTERCEPT_FUNCTION(fopen);  \
+-  COMMON_INTERCEPT_FUNCTION(fdopen); \
+   COMMON_INTERCEPT_FUNCTION(freopen);
+ #else
+ #define INIT_FOPEN
+ #endif
+ 
++#if SANITIZER_INTERCEPT_FDOPEN
++INTERCEPTOR(__sanitizer_FILE *, fdopen, int fd, const char *mode) {
++  void *ctx;
++  COMMON_INTERCEPTOR_ENTER(ctx, fdopen, fd, mode);
++  COMMON_INTERCEPTOR_READ_RANGE(ctx, mode, REAL(strlen)(mode) + 1);
++  __sanitizer_FILE *res = REAL(fdopen)(fd, mode);
++  if (res) unpoison_file(res);
++  return res;
++}
++#define INIT_FDOPEN                  \
++  COMMON_INTERCEPT_FUNCTION(fdopen);
++#else
++#define INIT_FDOPEN
++#endif
++
+ #if SANITIZER_INTERCEPT_FOPEN64
+ INTERCEPTOR(__sanitizer_FILE *, fopen64, const char *path, const char *mode) {
+   void *ctx;
+@@ -6446,8 +6512,10 @@ static void InitializeCommonInterceptors() {
+   INIT_PRCTL;
+   INIT_LOCALTIME_AND_FRIENDS;
+   INIT_STRPTIME;
++  INIT_FSCANF;
+   INIT_SCANF;
+   INIT_ISOC99_SCANF;
++  INIT_FPRINTF;
+   INIT_PRINTF;
+   INIT_PRINTF_L;
+   INIT_ISOC99_PRINTF;
+@@ -6460,6 +6528,7 @@ static void InitializeCommonInterceptors() {
+   INIT_GETPWENT_R;
+   INIT_SETPWENT;
+   INIT_CLOCK_GETTIME;
++  INIT_CLOCK_SETTIME;
+   INIT_GETITIMER;
+   INIT_TIME;
+   INIT_GLOB;
+@@ -6487,7 +6556,9 @@ static void InitializeCommonInterceptors() {
+   INIT_IOCTL;
+   INIT_INET_ATON;
+   INIT_SYSINFO;
++  INIT_OPENDIR;
+   INIT_READDIR;
++  INIT_READDIR_R;
+   INIT_READDIR64;
+   INIT_PTRACE;
+   INIT_SETLOCALE;
+@@ -6580,6 +6651,7 @@ static void InitializeCommonInterceptors() {
+   INIT_TSEARCH;
+   INIT_LIBIO_INTERNALS;
+   INIT_FOPEN;
++  INIT_FDOPEN;
+   INIT_FOPEN64;
+   INIT_OPEN_MEMSTREAM;
+   INIT_OBSTACK;
+diff --git a/lib/sanitizer_common/sanitizer_common_interceptors_format.inc b/lib/sanitizer_common/sanitizer_common_interceptors_format.inc
+index 5ebe5a6..5409676 100644
+--- a/lib/sanitizer_common/sanitizer_common_interceptors_format.inc
++++ b/lib/sanitizer_common/sanitizer_common_interceptors_format.inc
+@@ -344,7 +344,7 @@ static void scanf_common(void *ctx, int n_inputs, bool allowGnuMalloc,
+   }
+ }
+ 
+-#if SANITIZER_INTERCEPT_PRINTF
++#if SANITIZER_INTERCEPT_PRINTF || SANITIZER_INTERCEPT_FPRINTF
+ 
+ struct PrintfDirective {
+   int fieldWidth;
+diff --git a/lib/sanitizer_common/sanitizer_common_interceptors_ioctl.inc b/lib/sanitizer_common/sanitizer_common_interceptors_ioctl.inc
+index 24e7548..6607722 100644
+--- a/lib/sanitizer_common/sanitizer_common_interceptors_ioctl.inc
++++ b/lib/sanitizer_common/sanitizer_common_interceptors_ioctl.inc
+@@ -47,6 +47,12 @@ static void ioctl_table_fill() {
+     ++ioctl_table_size;                                  \
+   }
+ 
++#if SANITIZER_CLOUDABI
++// The only ioctls supported on CloudABI
++  _(FIONREAD, READ, sizeof(int));
++  _(FIONBIO, WRITE, sizeof(int));
++#else
++
+   _(FIOASYNC, READ, sizeof(int));
+   _(FIOCLEX, NONE, 0);
+   _(FIOGETOWN, WRITE, sizeof(int));
+@@ -465,6 +471,7 @@ static void ioctl_table_fill() {
+   // _(SIOCAX25GETPARMS, WRITE, struct_ax25_parms_struct_sz);
+   // _(SIOCAX25SETPARMS, READ, struct_ax25_parms_struct_sz);
+ #endif
++#endif /* CLOUDABI */
+ #undef _
+ }
+ 
+@@ -583,11 +590,13 @@ static void ioctl_common_pre(void *ctx, const ioctl_desc *desc, int d,
+   }
+   if (desc->type != ioctl_desc::CUSTOM)
+     return;
++#ifdef IOCTL_SIOCGIFCONF
+   if (request == IOCTL_SIOCGIFCONF) {
+     struct __sanitizer_ifconf *ifc = (__sanitizer_ifconf *)arg;
+     COMMON_INTERCEPTOR_READ_RANGE(ctx, (char*)&ifc->ifc_len,
+                                   sizeof(ifc->ifc_len));
+   }
++#endif
+ }
+ 
+ static void ioctl_common_post(void *ctx, const ioctl_desc *desc, int res, int d,
+@@ -599,8 +608,10 @@ static void ioctl_common_post(void *ctx, const ioctl_desc *desc, int res, int d,
+   }
+   if (desc->type != ioctl_desc::CUSTOM)
+     return;
++#ifdef IOCTL_SIOCGIFCONF
+   if (request == IOCTL_SIOCGIFCONF) {
+     struct __sanitizer_ifconf *ifc = (__sanitizer_ifconf *)arg;
+     COMMON_INTERCEPTOR_WRITE_RANGE(ctx, ifc->ifc_ifcu.ifcu_req, ifc->ifc_len);
+   }
++#endif
+ }
+diff --git a/lib/sanitizer_common/sanitizer_common_libcdep.cc b/lib/sanitizer_common/sanitizer_common_libcdep.cc
+index 5cdfbbb..431910f 100644
+--- a/lib/sanitizer_common/sanitizer_common_libcdep.cc
++++ b/lib/sanitizer_common/sanitizer_common_libcdep.cc
+@@ -147,7 +147,7 @@ void BackgroundThread(void *arg) {
+ }
+ #endif
+ 
+-#if !SANITIZER_FUCHSIA && !SANITIZER_GO
++#if !SANITIZER_FUCHSIA && !SANITIZER_GO && !SANITIZER_CLOUDABI
+ void StartReportDeadlySignal() {
+   // Write the first message using fd=2, just in case.
+   // It may actually fail to write in case stderr is closed.
+@@ -157,7 +157,7 @@ void StartReportDeadlySignal() {
+ }
+ 
+ static void MaybeReportNonExecRegion(uptr pc) {
+-#if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD
++#if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD || SANITIZER_CLOUDABI
+   MemoryMappingLayout proc_maps(/*cache_enabled*/ true);
+   MemoryMappedSegment segment;
+   while (proc_maps.Next(&segment)) {
+diff --git a/lib/sanitizer_common/sanitizer_coverage_libcdep_new.cc b/lib/sanitizer_common/sanitizer_coverage_libcdep_new.cc
+index 3c5f29b..b77cdb9 100644
+--- a/lib/sanitizer_common/sanitizer_coverage_libcdep_new.cc
++++ b/lib/sanitizer_common/sanitizer_coverage_libcdep_new.cc
+@@ -10,7 +10,7 @@
+ 
+ #include "sanitizer_platform.h"
+ 
+-#if !SANITIZER_FUCHSIA
++#if !SANITIZER_FUCHSIA && !SANITIZER_CLOUDABI
+ #include "sancov_flags.h"
+ #include "sanitizer_allocator_internal.h"
+ #include "sanitizer_atomic.h"
+diff --git a/lib/sanitizer_common/sanitizer_errno.h b/lib/sanitizer_common/sanitizer_errno.h
+index 42cc290..e15b69c 100644
+--- a/lib/sanitizer_common/sanitizer_errno.h
++++ b/lib/sanitizer_common/sanitizer_errno.h
+@@ -22,6 +22,10 @@
+ #include "sanitizer_errno_codes.h"
+ #include "sanitizer_platform.h"
+ 
++#if SANITIZER_CLOUDABI
++#include <errno.h>
++#else
++
+ #if SANITIZER_FREEBSD || SANITIZER_MAC
+ #  define __errno_location __error
+ #elif SANITIZER_ANDROID || SANITIZER_NETBSD
+@@ -35,5 +39,6 @@
+ extern "C" int *__errno_location();
+ 
+ #define errno (*__errno_location())
++#endif
+ 
+ #endif  // SANITIZER_ERRNO_H
+diff --git a/lib/sanitizer_common/sanitizer_errno_codes.h b/lib/sanitizer_common/sanitizer_errno_codes.h
+index dba774c..21a9fc8 100644
+--- a/lib/sanitizer_common/sanitizer_errno_codes.h
++++ b/lib/sanitizer_common/sanitizer_errno_codes.h
+@@ -20,11 +20,20 @@
+ #ifndef SANITIZER_ERRNO_CODES_H
+ #define SANITIZER_ERRNO_CODES_H
+ 
++#include "sanitizer_platform.h"
++
+ namespace __sanitizer {
+ 
++#if SANITIZER_CLOUDABI
++#include <cloudabi_types_common.h>
++#define errno_ENOMEM CLOUDABI_ENOMEM
++#define errno_EBUSY CLOUDABI_EBUSY
++#define errno_EINVAL CLOUDABI_EINVAL
++#else
+ #define errno_ENOMEM 12
+ #define errno_EBUSY 16
+ #define errno_EINVAL 22
++#endif
+ 
+ // Those might not present or their value differ on different platforms.
+ extern const int errno_EOWNERDEAD;
+diff --git a/lib/sanitizer_common/sanitizer_file.cc b/lib/sanitizer_common/sanitizer_file.cc
+index cde54bf..8e616d6 100644
+--- a/lib/sanitizer_common/sanitizer_file.cc
++++ b/lib/sanitizer_common/sanitizer_file.cc
+@@ -16,7 +16,29 @@
+ 
+ #include "sanitizer_platform.h"
+ 
+-#if !SANITIZER_FUCHSIA
++#if SANITIZER_CLOUDABI
++#include "sanitizer_common.h"
++#include "sanitizer_file.h"
++#include <stdio.h>
++#include <unistd.h>
++
++namespace __sanitizer {
++// overwrite these functions to make them write to stderr
++void CatastrophicErrorWrite(const char *buffer, uptr length) {
++  fwrite(buffer, length, 1, stderr);
++}
++void RawWrite(const char *buffer) {
++  fwrite(buffer, internal_strlen(buffer), 1, stderr);
++}
++void ReportFile::ReopenIfNecessary() {}
++extern "C" {
++void __sanitizer_set_report_path(const char *path) {}
++}
++StaticSpinMutex report_file_mu;
++ReportFile report_file = {&report_file_mu, kStderrFd, "", "", 0};
++}
++
++#elif !SANITIZER_FUCHSIA
+ 
+ #include "sanitizer_common.h"
+ #include "sanitizer_file.h"
+diff --git a/lib/sanitizer_common/sanitizer_flag_parser.cc b/lib/sanitizer_common/sanitizer_flag_parser.cc
+index 67830b2..ae76b0c 100644
+--- a/lib/sanitizer_common/sanitizer_flag_parser.cc
++++ b/lib/sanitizer_common/sanitizer_flag_parser.cc
+@@ -127,6 +127,7 @@ void FlagParser::ParseString(const char *s) {
+   pos_ = old_pos_;
+ }
+ 
++#if !SANITIZER_CLOUDABI
+ bool FlagParser::ParseFile(const char *path, bool ignore_missing) {
+   static const uptr kMaxIncludeSize = 1 << 15;
+   char *data;
+@@ -144,6 +145,7 @@ bool FlagParser::ParseFile(const char *path, bool ignore_missing) {
+   UnmapOrDie(data, data_mapped_size);
+   return true;
+ }
++#endif
+ 
+ bool FlagParser::run_handler(const char *name, const char *value) {
+   for (int i = 0; i < n_flags_; ++i) {
+diff --git a/lib/sanitizer_common/sanitizer_flags.cc b/lib/sanitizer_common/sanitizer_flags.cc
+index 913ce3c..b576917 100644
+--- a/lib/sanitizer_common/sanitizer_flags.cc
++++ b/lib/sanitizer_common/sanitizer_flags.cc
+@@ -60,7 +60,11 @@ void SubstituteForFlagValue(const char *s, char *out, uptr out_size) {
+         break;
+       }
+       case 'p': {
++#if SANITIZER_CLOUDABI
++        int pid = 0;
++#else
+         int pid = internal_getpid();
++#endif
+         char buf[32];
+         char *buf_pos = buf + 32;
+         do {
+@@ -89,6 +93,9 @@ class FlagHandlerInclude : public FlagHandlerBase {
+   explicit FlagHandlerInclude(FlagParser *parser, bool ignore_missing)
+       : parser_(parser), ignore_missing_(ignore_missing) {}
+   bool Parse(const char *value) final {
++#if SANITIZER_CLOUDABI
++    return false;
++#else
+     if (internal_strchr(value, '%')) {
+       char *buf = (char *)MmapOrDie(kMaxPathLength, "FlagHandlerInclude");
+       SubstituteForFlagValue(value, buf, kMaxPathLength);
+@@ -97,6 +104,7 @@ class FlagHandlerInclude : public FlagHandlerBase {
+       return res;
+     }
+     return parser_->ParseFile(value, ignore_missing_);
++#endif
+   }
+ };
+ 
+diff --git a/lib/sanitizer_common/sanitizer_internal_defs.h b/lib/sanitizer_common/sanitizer_internal_defs.h
+index dc480e7..370041c 100644
+--- a/lib/sanitizer_common/sanitizer_internal_defs.h
++++ b/lib/sanitizer_common/sanitizer_internal_defs.h
+@@ -36,7 +36,7 @@
+ #endif
+ 
+ // TLS is handled differently on different platforms
+-#if SANITIZER_LINUX || SANITIZER_NETBSD
++#if SANITIZER_LINUX || SANITIZER_NETBSD || SANITIZER_CLOUDABI
+ # define SANITIZER_TLS_INITIAL_EXEC_ATTRIBUTE \
+     __attribute__((tls_model("initial-exec"))) thread_local
+ #else
+@@ -148,7 +148,7 @@ typedef int pid_t;
+ #endif
+ 
+ #if SANITIZER_FREEBSD || SANITIZER_NETBSD || SANITIZER_MAC || \
+-    (SANITIZER_LINUX && defined(__x86_64__))
++    SANITIZER_CLOUDABI || (SANITIZER_LINUX && defined(__x86_64__))
+ typedef u64 OFF_T;
+ #else
+ typedef uptr OFF_T;
+diff --git a/lib/sanitizer_common/sanitizer_libignore.cc b/lib/sanitizer_common/sanitizer_libignore.cc
+index 0df055e..ea2195e 100644
+--- a/lib/sanitizer_common/sanitizer_libignore.cc
++++ b/lib/sanitizer_common/sanitizer_libignore.cc
+@@ -9,7 +9,7 @@
+ 
+ #include "sanitizer_platform.h"
+ 
+-#if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_MAC || SANITIZER_NETBSD
++#if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_MAC || SANITIZER_NETBSD || SANITIZER_CLOUDABI
+ 
+ #include "sanitizer_libignore.h"
+ #include "sanitizer_flags.h"
+@@ -126,4 +126,4 @@ void LibIgnore::OnLibraryUnloaded() {
+ } // namespace __sanitizer
+ 
+ #endif  // SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_MAC ||
+-        // SANITIZER_NETBSD
++        // SANITIZER_NETBSD || SANITIZER_CLOUDABI
+diff --git a/lib/sanitizer_common/sanitizer_linux.h b/lib/sanitizer_common/sanitizer_linux.h
+index 2d227f8..f85d4c4 100644
+--- a/lib/sanitizer_common/sanitizer_linux.h
++++ b/lib/sanitizer_common/sanitizer_linux.h
+@@ -15,7 +15,7 @@
+ 
+ #include "sanitizer_platform.h"
+ #if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD || \
+-    SANITIZER_SOLARIS
++    SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ #include "sanitizer_common.h"
+ #include "sanitizer_internal_defs.h"
+ #include "sanitizer_platform_limits_netbsd.h"
+@@ -44,10 +44,13 @@ struct MemoryMappingLayoutData {
+ void ReadProcMaps(ProcSelfMapsBuff *proc_maps);
+ 
+ // Syscall wrappers.
++#if !SANITIZER_CLOUDABI
+ uptr internal_getdents(fd_t fd, struct linux_dirent *dirp, unsigned int count);
+ uptr internal_sigaltstack(const void* ss, void* oss);
+ uptr internal_sigprocmask(int how, __sanitizer_sigset_t *set,
+     __sanitizer_sigset_t *oldset);
++#endif
++
+ uptr internal_clock_gettime(__sanitizer_clockid_t clk_id, void *tp);
+ 
+ // Linux-only syscalls.
+@@ -146,5 +149,5 @@ ALWAYS_INLINE uptr *get_android_tls_ptr() {
+ }  // namespace __sanitizer
+ 
+ #endif  // SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD ||
+-        // SANITIZER_SOLARIS
++        // SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ #endif  // SANITIZER_LINUX_H
+diff --git a/lib/sanitizer_common/sanitizer_linux_libcdep.cc b/lib/sanitizer_common/sanitizer_linux_libcdep.cc
+index 56fdfc8..1e2c90b 100644
+--- a/lib/sanitizer_common/sanitizer_linux_libcdep.cc
++++ b/lib/sanitizer_common/sanitizer_linux_libcdep.cc
+@@ -15,7 +15,7 @@
+ #include "sanitizer_platform.h"
+ 
+ #if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD || \
+-    SANITIZER_SOLARIS
++    SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ 
+ #include "sanitizer_allocator_internal.h"
+ #include "sanitizer_atomic.h"
+@@ -74,8 +74,32 @@ struct __sanitizer::linux_dirent {
+ #include <unistd.h>
+ #endif
+ 
++#if SANITIZER_CLOUDABI
++#include <cloudabi_syscalls.h>
++#include <asan/asan_mapping.h>
++
++extern const void *__pt_tls_vaddr_abs;
++extern const size_t __pt_tls_memsz_aligned;
++extern thread_local void *__safestack_unsafe_stack_ptr;
++
++struct __pthread {
++  void *join;                     // Join queue used by pthread_join().
++  void *return_value;             // Value returned by pthread_join().
++  void *safe_stack;               // Safe stack buffer used by this thread.
++  void *unsafe_stack;             // Unsafe stack buffer used by this thread.
++  size_t unsafe_stacksize;        // Size of the unsafe stack buffer.
++  unsigned int refcount;            // Thread handle and stack reference count.
++
++  void *(*start_routine)(void *);  // User-supplied startup routine.
++  void *argument;                  // Argument for startup routine.
++};
++
++#define PTHREAD_STACK_DEFAULT (1 << 20)
++#endif
++
+ namespace __sanitizer {
+ 
++#if !SANITIZER_CLOUDABI
+ SANITIZER_WEAK_ATTRIBUTE int
+ real_sigaction(int signum, const void *act, void *oldact);
+ 
+@@ -84,9 +108,11 @@ int internal_sigaction(int signum, const void *act, void *oldact) {
+   if (&real_sigaction)
+     return real_sigaction(signum, act, oldact);
+ #endif
++
+   return sigaction(signum, (const struct sigaction *)act,
+                    (struct sigaction *)oldact);
+ }
++#endif
+ 
+ void GetThreadStackTopAndBottom(bool at_initialization, uptr *stack_top,
+                                 uptr *stack_bottom) {
+@@ -94,19 +120,32 @@ void GetThreadStackTopAndBottom(bool at_initialization, uptr *stack_top,
+   CHECK(stack_bottom);
+   if (at_initialization) {
+     // This is the main thread. Libpthread may not be initialized yet.
+-    struct rlimit rl;
+-    CHECK_EQ(getrlimit(RLIMIT_STACK, &rl), 0);
+ 
+     // Find the mapping that contains a stack variable.
+     MemoryMappingLayout proc_maps(/*cache_enabled*/true);
+     MemoryMappedSegment segment;
+     uptr prev_end = 0;
+     while (proc_maps.Next(&segment)) {
+-      if ((uptr)&rl < segment.end) break;
++      if ((uptr)&prev_end < segment.end) break;
+       prev_end = segment.end;
+     }
+-    CHECK((uptr)&rl >= segment.start && (uptr)&rl < segment.end);
+-
++    // NOTE: this next assertion fails without this call:
++    char clbuf[16];
++    internal_snprintf(clbuf, sizeof(clbuf), "%p", &prev_end);
++
++    CHECK((uptr)&prev_end >= segment.start && (uptr)&prev_end < segment.end);
++
++#if SANITIZER_CLOUDABI
++    // We cannot establish the actual stack size, so we assume the entire segment is stack.
++    // Note: This *probably* returns the .bss segment which contains the unsafe stack.
++    // Align by shadow granularity; this is later assumed of the stack boundaries
++    *stack_top = RoundUpTo(segment.end, SHADOW_GRANULARITY);
++    *stack_bottom = RoundDownTo(segment.start, SHADOW_GRANULARITY);
++    CHECK(__asan::AddrIsAlignedByGranularity(*stack_top));
++    CHECK(__asan::AddrIsAlignedByGranularity(*stack_bottom));
++#else
++    struct rlimit rl;
++    CHECK_EQ(getrlimit(RLIMIT_STACK, &rl), 0);
+     // Get stacksize from rlimit, but clip it so that it does not overlap
+     // with other mappings.
+     uptr stacksize = rl.rlim_cur;
+@@ -118,6 +157,7 @@ void GetThreadStackTopAndBottom(bool at_initialization, uptr *stack_top,
+       stacksize = kMaxThreadStackSize;
+     *stack_top = segment.end;
+     *stack_bottom = segment.end - stacksize;
++#endif
+     return;
+   }
+   uptr stacksize = 0;
+@@ -127,6 +167,21 @@ void GetThreadStackTopAndBottom(bool at_initialization, uptr *stack_top,
+   CHECK_EQ(thr_stksegment(&ss), 0);
+   stacksize = ss.ss_size;
+   stackaddr = (char *)ss.ss_sp - stacksize;
++#elif SANITIZER_CLOUDABI
++  // TODO: CloudABI has safe-stack always enabled, so it has two stacks. We'll
++  // return the unsafe stack, since it contains all variables that are used
++  // in an unsafe way, so more likely to be interesting to ASAN. But is this
++  // always what the code expects?
++  pthread_t thisthread = pthread_self();
++
++  // To return the safe stack:
++  //stackaddr = thisthread->safe_stack;
++  // TODO: how to establish the safe stack size?
++  //stacksize = PTHREAD_STACK_DEFAULT;
++
++  // To return the unsafe stack:
++  stackaddr = thisthread->unsafe_stack;
++  stacksize = thisthread->unsafe_stacksize;
+ #else // !SANITIZER_SOLARIS
+   pthread_attr_t attr;
+   pthread_attr_init(&attr);
+@@ -139,7 +194,7 @@ void GetThreadStackTopAndBottom(bool at_initialization, uptr *stack_top,
+   *stack_bottom = (uptr)stackaddr;
+ }
+ 
+-#if !SANITIZER_GO
++#if !SANITIZER_GO && !SANITIZER_CLOUDABI
+ bool SetEnv(const char *name, const char *value) {
+   void *f = dlsym(RTLD_NEXT, "setenv");
+   if (!f)
+@@ -174,7 +229,7 @@ bool SanitizerGetThreadName(char *name, int max_len) {
+ }
+ 
+ #if !SANITIZER_FREEBSD && !SANITIZER_ANDROID && !SANITIZER_GO && \
+-    !SANITIZER_NETBSD && !SANITIZER_SOLARIS
++    !SANITIZER_NETBSD && !SANITIZER_SOLARIS && !SANITIZER_CLOUDABI
+ static uptr g_tls_size;
+ 
+ #ifdef __i386__
+@@ -439,6 +494,18 @@ static void GetTls(uptr *addr, uptr *size) {
+   // FIXME
+   *addr = 0;
+   *size = 0;
++#elif SANITIZER_CLOUDABI
++  // TODO
++  *addr = 0;
++  *size = 0;
++/*
++  // TODO FIXME: this is the address of the main thread, not the current thread!
++  uptr end_addr = (uptr)__pt_tls_vaddr_abs + __pt_tls_memsz_aligned;
++  *addr = RoundDownTo((uptr)__pt_tls_vaddr_abs, SHADOW_GRANULARITY);
++  *size = RoundUpTo(end_addr - *addr, SHADOW_GRANULARITY);
++  CHECK(__asan::AddrIsAlignedByGranularity(*addr));
++  CHECK(__asan::AddrIsAlignedByGranularity(*addr + *size));
++*/
+ #else
+ # error "Unknown OS"
+ #endif
+@@ -448,7 +515,7 @@ static void GetTls(uptr *addr, uptr *size) {
+ #if !SANITIZER_GO
+ uptr GetTlsSize() {
+ #if SANITIZER_FREEBSD || SANITIZER_ANDROID || SANITIZER_NETBSD || \
+-    SANITIZER_SOLARIS
++    SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+   uptr addr, size;
+   GetTls(&addr, &size);
+   return size;
+@@ -549,6 +616,10 @@ static void procmapsInit(InternalMmapVectorNoCtor<LoadedModule> *modules) {
+ }
+ 
+ void ListOfModules::init() {
++#if SANITIZER_CLOUDABI
++  // No dynamic loading on CloudABI
++  clear();
++#else
+   clearOrInit();
+   if (requiresProcmaps()) {
+     procmapsInit(&modules_);
+@@ -556,19 +627,26 @@ void ListOfModules::init() {
+     DlIteratePhdrData data = {&modules_, true};
+     dl_iterate_phdr(dl_iterate_phdr_cb, &data);
+   }
++#endif
+ }
+ 
+ // When a custom loader is used, dl_iterate_phdr may not contain the full
+ // list of modules. Allow callers to fall back to using procmaps.
+ void ListOfModules::fallbackInit() {
++#if SANITIZER_CLOUDABI
++  // No dynamic loading on CloudABI
++  clear();
++#else
+   if (!requiresProcmaps()) {
+     clearOrInit();
+     procmapsInit(&modules_);
+   } else {
+     clear();
+   }
++#endif
+ }
+ 
++#if !SANITIZER_CLOUDABI
+ // getrusage does not give us the current RSS, only the max RSS.
+ // Still, this is better than nothing if /proc/self/statm is not available
+ // for some reason, e.g. due to a sandbox.
+@@ -607,6 +685,7 @@ uptr GetRSS() {
+     rss = rss * 10 + *pos++ - '0';
+   return rss * GetPageSizeCached();
+ }
++#endif
+ 
+ // sysconf(_SC_NPROCESSORS_{CONF,ONLN}) cannot be used on most platforms as
+ // they allocate memory.
+@@ -655,7 +734,7 @@ u32 GetNumberOfCPUs() {
+   }
+   internal_close(fd);
+   return n_cpus;
+-#elif SANITIZER_SOLARIS
++#elif SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+   return sysconf(_SC_NPROCESSORS_ONLN);
+ #else
+   cpu_set_t CPUs;
+@@ -727,7 +806,7 @@ void LogMessageOnPrintf(const char *str) {
+ 
+ #endif  // SANITIZER_LINUX
+ 
+-#if SANITIZER_LINUX && !SANITIZER_GO
++#if (SANITIZER_LINUX || SANITIZER_CLOUDABI) && !SANITIZER_GO
+ // glibc crashes when using clock_gettime from a preinit_array function as the
+ // vDSO function pointers haven't been initialized yet. __progname is
+ // initialized after the vDSO function pointers, so if it exists, is not null
+@@ -735,8 +814,8 @@ void LogMessageOnPrintf(const char *str) {
+ extern "C" SANITIZER_WEAK_ATTRIBUTE char *__progname;
+ INLINE bool CanUseVDSO() {
+   // Bionic is safe, it checks for the vDSO function pointers to be initialized.
+-  if (SANITIZER_ANDROID)
+-    return true;
++  if (SANITIZER_ANDROID || SANITIZER_CLOUDABI)
++    return false; /* TODO: should be true; */
+   if (&__progname && __progname && *__progname)
+     return true;
+   return false;
+@@ -745,8 +824,13 @@ INLINE bool CanUseVDSO() {
+ // MonotonicNanoTime is a timing function that can leverage the vDSO by calling
+ // clock_gettime. real_clock_gettime only exists if clock_gettime is
+ // intercepted, so define it weakly and use it if available.
++#if !SANITIZER_CLOUDABI
+ extern "C" SANITIZER_WEAK_ATTRIBUTE
+ int real_clock_gettime(u32 clk_id, void *tp);
++#else
++extern "C" SANITIZER_WEAK_ATTRIBUTE
++int real_clock_gettime(const struct ::__clockid *clk_id, void *tp);
++#endif
+ u64 MonotonicNanoTime() {
+   timespec ts;
+   if (CanUseVDSO()) {
+@@ -770,4 +854,4 @@ u64 MonotonicNanoTime() {
+ 
+ } // namespace __sanitizer
+ 
+-#endif  // SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD
++#endif  // SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD || SANITIZER_CLOUDABI
+diff --git a/lib/sanitizer_common/sanitizer_platform.h b/lib/sanitizer_common/sanitizer_platform.h
+index 334903c..701fd5b 100644
+--- a/lib/sanitizer_common/sanitizer_platform.h
++++ b/lib/sanitizer_common/sanitizer_platform.h
+@@ -15,7 +15,7 @@
+ 
+ #if !defined(__linux__) && !defined(__FreeBSD__) && !defined(__NetBSD__) && \
+   !defined(__APPLE__) && !defined(_WIN32) && !defined(__Fuchsia__) && \
+-  !(defined(__sun__) && defined(__svr4__))
++  !(defined(__sun__) && defined(__svr4__)) && !defined(__CloudABI__)
+ # error "This operating system is not supported"
+ #endif
+ 
+@@ -98,9 +98,15 @@
+ # define SANITIZER_FUCHSIA 0
+ #endif
+ 
++#if defined(__CloudABI__)
++# define SANITIZER_CLOUDABI 1
++#else
++# define SANITIZER_CLOUDABI 0
++#endif
++
+ #define SANITIZER_POSIX \
+   (SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_MAC || \
+-    SANITIZER_NETBSD || SANITIZER_SOLARIS)
++    SANITIZER_NETBSD || SANITIZER_SOLARIS || SANITIZER_CLOUDABI)
+ 
+ #if __LP64__ || defined(_WIN64)
+ #  define SANITIZER_WORDSIZE 64
+@@ -296,7 +302,9 @@
+ # define SANITIZER_SUPPRESS_LEAK_ON_PTHREAD_EXIT 0
+ #endif
+ 
+-#if SANITIZER_FREEBSD || SANITIZER_MAC || SANITIZER_NETBSD || SANITIZER_SOLARIS
++#if SANITIZER_CLOUDABI
++# define SANITIZER_MADVISE_DONTNEED POSIX_MADV_DONTNEED
++#elif SANITIZER_FREEBSD || SANITIZER_MAC || SANITIZER_NETBSD || SANITIZER_SOLARIS
+ # define SANITIZER_MADVISE_DONTNEED MADV_FREE
+ #else
+ # define SANITIZER_MADVISE_DONTNEED MADV_DONTNEED
+diff --git a/lib/sanitizer_common/sanitizer_platform_interceptors.h b/lib/sanitizer_common/sanitizer_platform_interceptors.h
+index b99ac44..db86189 100644
+--- a/lib/sanitizer_common/sanitizer_platform_interceptors.h
++++ b/lib/sanitizer_common/sanitizer_platform_interceptors.h
+@@ -16,6 +16,12 @@
+ 
+ #include "sanitizer_internal_defs.h"
+ 
++#if SANITIZER_CLOUDABI
++# define SI_CLOUDABI 1
++#else
++# define SI_CLOUDABI 0
++#endif
++
+ #if SANITIZER_POSIX
+ # define SI_POSIX 1
+ #else
+@@ -116,14 +122,14 @@
+ #define SANITIZER_INTERCEPT_STRNLEN (SI_NOT_MAC && SI_NOT_FUCHSIA)
+ #define SANITIZER_INTERCEPT_STRCMP SI_NOT_FUCHSIA
+ #define SANITIZER_INTERCEPT_STRSTR SI_NOT_FUCHSIA
+-#define SANITIZER_INTERCEPT_STRCASESTR SI_POSIX
+-#define SANITIZER_INTERCEPT_STRTOK SI_NOT_FUCHSIA
++#define SANITIZER_INTERCEPT_STRCASESTR SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_STRTOK SI_NOT_FUCHSIA && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_STRCHR SI_NOT_FUCHSIA
+-#define SANITIZER_INTERCEPT_STRCHRNUL SI_POSIX_NOT_MAC
++#define SANITIZER_INTERCEPT_STRCHRNUL SI_POSIX_NOT_MAC && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_STRRCHR SI_NOT_FUCHSIA
+ #define SANITIZER_INTERCEPT_STRSPN SI_NOT_FUCHSIA
+ #define SANITIZER_INTERCEPT_STRPBRK SI_NOT_FUCHSIA
+-#define SANITIZER_INTERCEPT_TEXTDOMAIN SI_LINUX_NOT_ANDROID || SI_SOLARIS
++#define SANITIZER_INTERCEPT_TEXTDOMAIN (SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_STRCASECMP SI_POSIX
+ #define SANITIZER_INTERCEPT_MEMSET 1
+ #define SANITIZER_INTERCEPT_MEMMOVE 1
+@@ -141,7 +147,7 @@
+ // FIXME: enable memmem on Windows.
+ #define SANITIZER_INTERCEPT_MEMMEM (SI_POSIX && !SI_MAC_DEPLOYMENT_BELOW_10_7)
+ #define SANITIZER_INTERCEPT_MEMCHR SI_NOT_FUCHSIA
+-#define SANITIZER_INTERCEPT_MEMRCHR (SI_FREEBSD || SI_LINUX || SI_NETBSD)
++#define SANITIZER_INTERCEPT_MEMRCHR (SI_FREEBSD || SI_LINUX || SI_NETBSD || SI_CLOUDABI)
+ 
+ #define SANITIZER_INTERCEPT_READ SI_POSIX
+ #define SANITIZER_INTERCEPT_PREAD SI_POSIX
+@@ -151,28 +157,30 @@
+ #define SANITIZER_INTERCEPT_FREAD SI_POSIX
+ #define SANITIZER_INTERCEPT_FWRITE SI_POSIX
+ 
+-#define SANITIZER_INTERCEPT_PREAD64 SI_LINUX_NOT_ANDROID || SI_SOLARIS32
+-#define SANITIZER_INTERCEPT_PWRITE64 SI_LINUX_NOT_ANDROID || SI_SOLARIS32
++#define SANITIZER_INTERCEPT_PREAD64 (SI_LINUX_NOT_ANDROID || SI_SOLARIS32)
++#define SANITIZER_INTERCEPT_PWRITE64 (SI_LINUX_NOT_ANDROID || SI_SOLARIS32)
+ 
+ #define SANITIZER_INTERCEPT_READV SI_POSIX
+ #define SANITIZER_INTERCEPT_WRITEV SI_POSIX
+ 
+ #define SANITIZER_INTERCEPT_PREADV \
+-  (SI_FREEBSD || SI_NETBSD || SI_LINUX_NOT_ANDROID)
+-#define SANITIZER_INTERCEPT_PWRITEV SI_LINUX_NOT_ANDROID
++  (SI_FREEBSD || SI_NETBSD || SI_LINUX_NOT_ANDROID || SI_CLOUDABI)
++#define SANITIZER_INTERCEPT_PWRITEV SI_LINUX_NOT_ANDROID || SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_PREADV64 SI_LINUX_NOT_ANDROID
+ #define SANITIZER_INTERCEPT_PWRITEV64 SI_LINUX_NOT_ANDROID
+ 
+ #define SANITIZER_INTERCEPT_PRCTL   SI_LINUX
+ 
+-#define SANITIZER_INTERCEPT_LOCALTIME_AND_FRIENDS SI_POSIX
+-#define SANITIZER_INTERCEPT_STRPTIME SI_POSIX
++#define SANITIZER_INTERCEPT_LOCALTIME_AND_FRIENDS SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_STRPTIME SI_POSIX && !SI_CLOUDABI
+ 
+-#define SANITIZER_INTERCEPT_SCANF SI_POSIX
++#define SANITIZER_INTERCEPT_SCANF SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_FSCANF SI_POSIX
+ #define SANITIZER_INTERCEPT_ISOC99_SCANF SI_LINUX_NOT_ANDROID
+ 
+ #ifndef SANITIZER_INTERCEPT_PRINTF
+-# define SANITIZER_INTERCEPT_PRINTF SI_POSIX
++# define SANITIZER_INTERCEPT_PRINTF SI_POSIX && !SI_CLOUDABI
++# define SANITIZER_INTERCEPT_FPRINTF SI_POSIX
+ # define SANITIZER_INTERCEPT_PRINTF_L (SI_FREEBSD || SI_NETBSD)
+ # define SANITIZER_INTERCEPT_ISOC99_PRINTF SI_LINUX_NOT_ANDROID
+ #endif
+@@ -183,30 +191,32 @@
+ #define SANITIZER_INTERCEPT_FREXP SI_NOT_FUCHSIA
+ #define SANITIZER_INTERCEPT_FREXPF_FREXPL SI_POSIX
+ 
+-#define SANITIZER_INTERCEPT_GETPWNAM_AND_FRIENDS SI_POSIX
++#define SANITIZER_INTERCEPT_GETPWNAM_AND_FRIENDS SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_GETPWNAM_R_AND_FRIENDS \
+   (SI_FREEBSD || SI_NETBSD || SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_GETPWENT \
+   (SI_FREEBSD || SI_NETBSD || SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+-#define SANITIZER_INTERCEPT_FGETPWENT SI_LINUX_NOT_ANDROID || SI_SOLARIS
++#define SANITIZER_INTERCEPT_FGETPWENT (SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_GETPWENT_R \
+   (SI_FREEBSD || SI_NETBSD || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_SETPWENT \
+   (SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_CLOCK_GETTIME \
++  (SI_FREEBSD || SI_NETBSD || SI_LINUX || SI_SOLARIS || SI_CLOUDABI)
++#define SANITIZER_INTERCEPT_CLOCK_SETTIME \
+   (SI_FREEBSD || SI_NETBSD || SI_LINUX || SI_SOLARIS)
+-#define SANITIZER_INTERCEPT_GETITIMER SI_POSIX
+-#define SANITIZER_INTERCEPT_TIME SI_POSIX
+-#define SANITIZER_INTERCEPT_GLOB SI_LINUX_NOT_ANDROID || SI_SOLARIS
++#define SANITIZER_INTERCEPT_GETITIMER SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_TIME SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_GLOB (SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_GLOB64 SI_LINUX_NOT_ANDROID
+-#define SANITIZER_INTERCEPT_WAIT SI_POSIX
+-#define SANITIZER_INTERCEPT_INET SI_POSIX
+-#define SANITIZER_INTERCEPT_PTHREAD_GETSCHEDPARAM SI_POSIX
++#define SANITIZER_INTERCEPT_WAIT SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_INET SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_PTHREAD_GETSCHEDPARAM SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_GETADDRINFO SI_POSIX
+ #define SANITIZER_INTERCEPT_GETNAMEINFO SI_POSIX
+-#define SANITIZER_INTERCEPT_GETSOCKNAME SI_POSIX
+-#define SANITIZER_INTERCEPT_GETHOSTBYNAME SI_POSIX
+-#define SANITIZER_INTERCEPT_GETHOSTBYNAME2 SI_POSIX && !SI_SOLARIS
++#define SANITIZER_INTERCEPT_GETSOCKNAME SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_GETHOSTBYNAME SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_GETHOSTBYNAME2 SI_POSIX && !SI_SOLARIS && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_GETHOSTBYNAME_R \
+   (SI_FREEBSD || SI_LINUX || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_GETHOSTBYNAME2_R \
+@@ -216,17 +226,19 @@
+ #define SANITIZER_INTERCEPT_GETHOSTENT_R \
+   (SI_FREEBSD || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_GETSOCKOPT SI_POSIX
+-#define SANITIZER_INTERCEPT_ACCEPT SI_POSIX
++#define SANITIZER_INTERCEPT_ACCEPT SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_ACCEPT4 SI_LINUX_NOT_ANDROID
+-#define SANITIZER_INTERCEPT_MODF SI_POSIX
+-#define SANITIZER_INTERCEPT_RECVMSG SI_POSIX
+-#define SANITIZER_INTERCEPT_SENDMSG SI_POSIX
+-#define SANITIZER_INTERCEPT_GETPEERNAME SI_POSIX
++#define SANITIZER_INTERCEPT_MODF SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_RECVMSG SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_SENDMSG SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_GETPEERNAME SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_IOCTL SI_POSIX
+ #define SANITIZER_INTERCEPT_INET_ATON SI_POSIX
+ #define SANITIZER_INTERCEPT_SYSINFO SI_LINUX
++#define SANITIZER_INTERCEPT_OPENDIR SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_READDIR SI_POSIX
+-#define SANITIZER_INTERCEPT_READDIR64 SI_LINUX_NOT_ANDROID || SI_SOLARIS32
++#define SANITIZER_INTERCEPT_READDIR_R SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_READDIR64 (SI_LINUX_NOT_ANDROID || SI_SOLARIS32)
+ #if SI_LINUX_NOT_ANDROID && \
+   (defined(__i386) || defined(__x86_64) || defined(__mips64) || \
+     defined(__powerpc64__) || defined(__aarch64__) || defined(__arm__) || \
+@@ -236,46 +248,46 @@
+ #define SANITIZER_INTERCEPT_PTRACE 0
+ #endif
+ #define SANITIZER_INTERCEPT_SETLOCALE SI_POSIX
+-#define SANITIZER_INTERCEPT_GETCWD SI_POSIX
++#define SANITIZER_INTERCEPT_GETCWD SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_GET_CURRENT_DIR_NAME SI_LINUX_NOT_ANDROID
+ #define SANITIZER_INTERCEPT_STRTOIMAX SI_POSIX
+ #define SANITIZER_INTERCEPT_MBSTOWCS SI_POSIX
+ #define SANITIZER_INTERCEPT_MBSNRTOWCS \
+-  (SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
++  (SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS || SI_CLOUDABI)
+ #define SANITIZER_INTERCEPT_WCSTOMBS SI_POSIX
+ #define SANITIZER_INTERCEPT_WCSNRTOMBS \
+-  (SI_FREEBSD || SI_NETBSD || SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
++  (SI_FREEBSD || SI_NETBSD || SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS || SI_CLOUDABI)
+ #define SANITIZER_INTERCEPT_WCRTOMB \
+-  (SI_FREEBSD || SI_NETBSD || SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+-#define SANITIZER_INTERCEPT_TCGETATTR SI_LINUX_NOT_ANDROID || SI_SOLARIS
+-#define SANITIZER_INTERCEPT_REALPATH SI_POSIX
++  (SI_FREEBSD || SI_NETBSD || SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS || SI_CLOUDABI)
++#define SANITIZER_INTERCEPT_TCGETATTR (SI_LINUX_NOT_ANDROID || SI_SOLARIS)
++#define SANITIZER_INTERCEPT_REALPATH SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_CANONICALIZE_FILE_NAME \
+   (SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_CONFSTR \
+   (SI_FREEBSD || SI_NETBSD || SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_SCHED_GETAFFINITY SI_LINUX_NOT_ANDROID
+-#define SANITIZER_INTERCEPT_SCHED_GETPARAM SI_LINUX_NOT_ANDROID || SI_SOLARIS
++#define SANITIZER_INTERCEPT_SCHED_GETPARAM (SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_STRERROR SI_POSIX
+ #define SANITIZER_INTERCEPT_STRERROR_R SI_POSIX
+ #define SANITIZER_INTERCEPT_XPG_STRERROR_R SI_LINUX_NOT_ANDROID
+ #define SANITIZER_INTERCEPT_SCANDIR \
+   (SI_FREEBSD || SI_NETBSD || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+-#define SANITIZER_INTERCEPT_SCANDIR64 SI_LINUX_NOT_ANDROID || SI_SOLARIS32
+-#define SANITIZER_INTERCEPT_GETGROUPS SI_POSIX
++#define SANITIZER_INTERCEPT_SCANDIR64 (SI_LINUX_NOT_ANDROID || SI_SOLARIS32)
++#define SANITIZER_INTERCEPT_GETGROUPS SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_POLL SI_POSIX
+ #define SANITIZER_INTERCEPT_PPOLL SI_LINUX_NOT_ANDROID || SI_SOLARIS
+ #define SANITIZER_INTERCEPT_WORDEXP \
+   (SI_FREEBSD || SI_NETBSD || (SI_MAC && !SI_IOS) || SI_LINUX_NOT_ANDROID || \
+     SI_SOLARIS)
+-#define SANITIZER_INTERCEPT_SIGWAIT SI_POSIX
+-#define SANITIZER_INTERCEPT_SIGWAITINFO SI_LINUX_NOT_ANDROID || SI_SOLARIS
+-#define SANITIZER_INTERCEPT_SIGTIMEDWAIT SI_LINUX_NOT_ANDROID || SI_SOLARIS
++#define SANITIZER_INTERCEPT_SIGWAIT SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_SIGWAITINFO (SI_LINUX_NOT_ANDROID || SI_SOLARIS)
++#define SANITIZER_INTERCEPT_SIGTIMEDWAIT (SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_SIGSETOPS \
+   (SI_FREEBSD || SI_NETBSD || SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+-#define SANITIZER_INTERCEPT_SIGPENDING SI_POSIX
+-#define SANITIZER_INTERCEPT_SIGPROCMASK SI_POSIX
++#define SANITIZER_INTERCEPT_SIGPENDING SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_SIGPROCMASK SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_BACKTRACE \
+-  (SI_FREEBSD || SI_NETBSD || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
++  (SI_FREEBSD || SI_NETBSD || SI_LINUX_NOT_ANDROID || SI_SOLARIS || SI_CLOUDABI)
+ #define SANITIZER_INTERCEPT_GETMNTENT SI_LINUX
+ #define SANITIZER_INTERCEPT_GETMNTENT_R SI_LINUX_NOT_ANDROID
+ #define SANITIZER_INTERCEPT_STATFS \
+@@ -285,22 +297,26 @@
+ #define SANITIZER_INTERCEPT_STATVFS \
+   (SI_FREEBSD || SI_NETBSD || SI_LINUX_NOT_ANDROID)
+ #define SANITIZER_INTERCEPT_STATVFS64 SI_LINUX_NOT_ANDROID
+-#define SANITIZER_INTERCEPT_INITGROUPS SI_POSIX
+-#define SANITIZER_INTERCEPT_ETHER_NTOA_ATON SI_POSIX
++#define SANITIZER_INTERCEPT_INITGROUPS SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_ETHER_NTOA_ATON SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_ETHER_HOST \
+   (SI_FREEBSD || SI_MAC || SI_LINUX_NOT_ANDROID)
+ #define SANITIZER_INTERCEPT_ETHER_R (SI_FREEBSD || SI_LINUX_NOT_ANDROID)
+ #define SANITIZER_INTERCEPT_SHMCTL                       \
+   (SI_NETBSD || SI_SOLARIS || ((SI_FREEBSD || SI_LINUX_NOT_ANDROID) && \
+-                 SANITIZER_WORDSIZE == 64))  // NOLINT
++                 SANITIZER_WORDSIZE == 64)) // NOLINT
+ #define SANITIZER_INTERCEPT_RANDOM_R SI_LINUX_NOT_ANDROID
+-#define SANITIZER_INTERCEPT_PTHREAD_ATTR_GET SI_POSIX
++
++// On CloudABI, some pthread attrs are supported, but others are not,
++// so disable all of them
++#define SANITIZER_INTERCEPT_PTHREAD_ATTR_GET SI_POSIX && !SI_CLOUDABI
++
+ #define SANITIZER_INTERCEPT_PTHREAD_ATTR_GETINHERITSCHED \
+   (SI_FREEBSD || SI_NETBSD || SI_MAC || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_PTHREAD_ATTR_GETAFFINITY_NP SI_LINUX_NOT_ANDROID
+ #define SANITIZER_INTERCEPT_PTHREAD_MUTEXATTR_GETPSHARED \
+-  (SI_POSIX && !SI_NETBSD)
+-#define SANITIZER_INTERCEPT_PTHREAD_MUTEXATTR_GETTYPE SI_POSIX
++  (SI_POSIX && !SI_NETBSD && !SI_CLOUDABI)
++#define SANITIZER_INTERCEPT_PTHREAD_MUTEXATTR_GETTYPE SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_PTHREAD_MUTEXATTR_GETPROTOCOL \
+   (SI_MAC || SI_NETBSD || SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_PTHREAD_MUTEXATTR_GETPRIOCEILING \
+@@ -309,18 +325,18 @@
+   (SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_PTHREAD_MUTEXATTR_GETROBUST_NP SI_LINUX_NOT_ANDROID
+ #define SANITIZER_INTERCEPT_PTHREAD_RWLOCKATTR_GETPSHARED \
+-  (SI_POSIX && !SI_NETBSD)
++  (SI_POSIX && !SI_NETBSD && !SI_CLOUDABI)
+ #define SANITIZER_INTERCEPT_PTHREAD_RWLOCKATTR_GETKIND_NP SI_LINUX_NOT_ANDROID
+ #define SANITIZER_INTERCEPT_PTHREAD_CONDATTR_GETPSHARED \
+-  (SI_POSIX && !SI_NETBSD)
++  (SI_POSIX && !SI_NETBSD && !SI_CLOUDABI)
+ #define SANITIZER_INTERCEPT_PTHREAD_CONDATTR_GETCLOCK \
+   (SI_LINUX_NOT_ANDROID || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_PTHREAD_BARRIERATTR_GETPSHARED \
+   (SI_LINUX_NOT_ANDROID && !SI_NETBSD)
+-#define SANITIZER_INTERCEPT_TMPNAM SI_POSIX
++#define SANITIZER_INTERCEPT_TMPNAM SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_TMPNAM_R SI_LINUX_NOT_ANDROID || SI_SOLARIS
+-#define SANITIZER_INTERCEPT_TTYNAME_R SI_POSIX
+-#define SANITIZER_INTERCEPT_TEMPNAM SI_POSIX
++#define SANITIZER_INTERCEPT_TTYNAME_R SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_TEMPNAM SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_SINCOS SI_LINUX || SI_SOLARIS
+ #define SANITIZER_INTERCEPT_REMQUO SI_POSIX
+ #define SANITIZER_INTERCEPT_LGAMMA SI_POSIX
+@@ -363,12 +379,13 @@
+ #define SANITIZER_INTERCEPT_AEABI_MEM 0
+ #endif
+ #define SANITIZER_INTERCEPT___BZERO SI_MAC
+-#define SANITIZER_INTERCEPT_FTIME (!SI_FREEBSD && !SI_NETBSD && SI_POSIX)
++#define SANITIZER_INTERCEPT_FTIME (!SI_FREEBSD && !SI_NETBSD && !SI_CLOUDABI && SI_POSIX)
+ #define SANITIZER_INTERCEPT_XDR SI_LINUX_NOT_ANDROID || SI_SOLARIS
+ #define SANITIZER_INTERCEPT_TSEARCH \
+   (SI_LINUX_NOT_ANDROID || SI_MAC || SI_NETBSD || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_LIBIO_INTERNALS SI_LINUX_NOT_ANDROID
+-#define SANITIZER_INTERCEPT_FOPEN SI_POSIX
++#define SANITIZER_INTERCEPT_FOPEN SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_FDOPEN SI_POSIX
+ #define SANITIZER_INTERCEPT_FOPEN64 SI_LINUX_NOT_ANDROID || SI_SOLARIS32
+ #define SANITIZER_INTERCEPT_OPEN_MEMSTREAM \
+   (SI_LINUX_NOT_ANDROID || SI_NETBSD || SI_SOLARIS)
+@@ -385,31 +402,31 @@
+   (SI_LINUX_NOT_ANDROID || SI_MAC || SI_NETBSD)
+ #define SANITIZER_INTERCEPT_TIMERFD SI_LINUX_NOT_ANDROID
+ 
+-#define SANITIZER_INTERCEPT_MLOCKX SI_POSIX
++#define SANITIZER_INTERCEPT_MLOCKX SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_FOPENCOOKIE SI_LINUX_NOT_ANDROID
+ #define SANITIZER_INTERCEPT_SEM \
+   (SI_LINUX || SI_FREEBSD || SI_NETBSD || SI_SOLARIS)
+-#define SANITIZER_INTERCEPT_PTHREAD_SETCANCEL SI_POSIX
++#define SANITIZER_INTERCEPT_PTHREAD_SETCANCEL SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_MINCORE (SI_LINUX || SI_NETBSD || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_PROCESS_VM_READV SI_LINUX
+ #define SANITIZER_INTERCEPT_CTERMID \
+   (SI_LINUX || SI_MAC || SI_FREEBSD || SI_NETBSD || SI_SOLARIS)
+ #define SANITIZER_INTERCEPT_CTERMID_R (SI_MAC || SI_FREEBSD || SI_SOLARIS)
+ 
+-#define SANITIZER_INTERCEPTOR_HOOKS (SI_LINUX || SI_MAC || SI_WINDOWS)
+-#define SANITIZER_INTERCEPT_RECV_RECVFROM SI_POSIX
+-#define SANITIZER_INTERCEPT_SEND_SENDTO SI_POSIX
++#define SANITIZER_INTERCEPTOR_HOOKS (SI_LINUX || SI_MAC || SI_WINDOWS || SI_CLOUDABI /* TODO? */)
++#define SANITIZER_INTERCEPT_RECV_RECVFROM SI_POSIX && !SI_CLOUDABI
++#define SANITIZER_INTERCEPT_SEND_SENDTO SI_POSIX && !SI_CLOUDABI
+ #define SANITIZER_INTERCEPT_EVENTFD_READ_WRITE SI_LINUX
+ 
+ #define SANITIZER_INTERCEPT_STAT \
+   (SI_FREEBSD || SI_MAC || SI_ANDROID || SI_NETBSD || SI_SOLARIS)
+-#define SANITIZER_INTERCEPT___XSTAT (!SANITIZER_INTERCEPT_STAT && SI_POSIX)
++#define SANITIZER_INTERCEPT___XSTAT (!SANITIZER_INTERCEPT_STAT && SI_POSIX && !SI_CLOUDABI)
+ #define SANITIZER_INTERCEPT___XSTAT64 SI_LINUX_NOT_ANDROID
+ #define SANITIZER_INTERCEPT___LXSTAT SANITIZER_INTERCEPT___XSTAT
+ #define SANITIZER_INTERCEPT___LXSTAT64 SI_LINUX_NOT_ANDROID
+ 
+ #define SANITIZER_INTERCEPT_UTMP \
+-  (SI_POSIX && !SI_MAC && !SI_FREEBSD && !SI_NETBSD)
++  (SI_POSIX && !SI_MAC && !SI_FREEBSD && !SI_NETBSD && !SI_CLOUDABI)
+ #define SANITIZER_INTERCEPT_UTMPX \
+   (SI_LINUX_NOT_ANDROID || SI_MAC || SI_FREEBSD || SI_NETBSD)
+ 
+@@ -427,7 +444,7 @@
+ #define SANITIZER_INTERCEPT_MALLOC_USABLE_SIZE (!SI_MAC)
+ #define SANITIZER_INTERCEPT_MCHECK_MPROBE SI_LINUX_NOT_ANDROID
+ #define SANITIZER_INTERCEPT_WCSCAT SI_POSIX
+-#define SANITIZER_INTERCEPT_SIGNAL_AND_SIGACTION (!SI_WINDOWS && SI_NOT_FUCHSIA)
++#define SANITIZER_INTERCEPT_SIGNAL_AND_SIGACTION (!SI_WINDOWS && SI_NOT_FUCHSIA && !SI_CLOUDABI)
+ #define SANITIZER_INTERCEPT_BSD_SIGNAL SI_ANDROID
+ 
+ #endif  // #ifndef SANITIZER_PLATFORM_INTERCEPTORS_H
+diff --git a/lib/sanitizer_common/sanitizer_platform_limits_posix.cc b/lib/sanitizer_common/sanitizer_platform_limits_posix.cc
+index f12e820..88a15eb 100644
+--- a/lib/sanitizer_common/sanitizer_platform_limits_posix.cc
++++ b/lib/sanitizer_common/sanitizer_platform_limits_posix.cc
+@@ -14,7 +14,7 @@
+ 
+ #include "sanitizer_platform.h"
+ 
+-#if SANITIZER_LINUX || SANITIZER_FREEBSD || SANITIZER_MAC
++#if SANITIZER_LINUX || SANITIZER_FREEBSD || SANITIZER_MAC || SANITIZER_CLOUDABI
+ // Tests in this file assume that off_t-dependent data structures match the
+ // libc ABI. For example, struct dirent here is what readdir() function (as
+ // exported from libc) returns, and not the user-facing "dirent", which
+@@ -25,13 +25,11 @@
+ #endif
+ #include <arpa/inet.h>
+ #include <dirent.h>
+-#include <grp.h>
+ #include <limits.h>
+ #include <net/if.h>
+ #include <netdb.h>
+ #include <poll.h>
+ #include <pthread.h>
+-#include <pwd.h>
+ #include <signal.h>
+ #include <stddef.h>
+ #include <sys/mman.h>
+@@ -42,18 +40,17 @@
+ #include <sys/times.h>
+ #include <sys/types.h>
+ #include <sys/utsname.h>
+-#include <termios.h>
+ #include <time.h>
+ #include <wchar.h>
+-#if !SANITIZER_MAC && !SANITIZER_FREEBSD
++#if !SANITIZER_MAC && !SANITIZER_FREEBSD && !SANITIZER_CLOUDABI
+ #include <utmp.h>
+ #endif
+ 
+-#if !SANITIZER_IOS
++#if !SANITIZER_IOS && !SANITIZER_CLOUDABI
+ #include <net/route.h>
+ #endif
+ 
+-#if !SANITIZER_ANDROID
++#if !SANITIZER_ANDROID && !SANITIZER_CLOUDABI
+ #include <sys/mount.h>
+ #include <sys/timeb.h>
+ #include <utmpx.h>
+@@ -78,6 +75,16 @@
+ #include <net/if_arp.h>
+ #endif
+ 
++#if SANITIZER_CLOUDABI
++# include <netinet/in.h>
++# include <link.h>
++# include <sys/ioctl.h>
++#else
++# include <grp.h>
++# include <pwd.h>
++# include <termios.h>
++#endif
++
+ #if SANITIZER_FREEBSD
+ # include <sys/mount.h>
+ # include <sys/sockio.h>
+@@ -130,7 +137,7 @@ typedef struct user_fpregs elf_fpregset_t;
+ # include <semaphore.h>
+ #endif
+ 
+-#if !SANITIZER_ANDROID
++#if !SANITIZER_ANDROID && !SANITIZER_CLOUDABI
+ #include <ifaddrs.h>
+ #include <sys/ucontext.h>
+ #include <wordexp.h>
+@@ -199,36 +206,38 @@ typedef struct user_fpregs elf_fpregset_t;
+ namespace __sanitizer {
+   unsigned struct_utsname_sz = sizeof(struct utsname);
+   unsigned struct_stat_sz = sizeof(struct stat);
+-#if !SANITIZER_IOS && !SANITIZER_FREEBSD
++#if !SANITIZER_IOS && !SANITIZER_FREEBSD && !SANITIZER_CLOUDABI
+   unsigned struct_stat64_sz = sizeof(struct stat64);
+ #endif // !SANITIZER_IOS && !SANITIZER_FREEBSD
+   unsigned struct_rusage_sz = sizeof(struct rusage);
+   unsigned struct_tm_sz = sizeof(struct tm);
++#if !SANITIZER_CLOUDABI
+   unsigned struct_passwd_sz = sizeof(struct passwd);
+   unsigned struct_group_sz = sizeof(struct group);
+   unsigned siginfo_t_sz = sizeof(siginfo_t);
+   unsigned struct_sigaction_sz = sizeof(struct sigaction);
+   unsigned struct_itimerval_sz = sizeof(struct itimerval);
++  unsigned uid_t_sz = sizeof(uid_t);
++  unsigned gid_t_sz = sizeof(gid_t);
++  unsigned struct_timezone_sz = sizeof(struct timezone);
++  unsigned struct_sigevent_sz = sizeof(struct sigevent);
++  unsigned struct_sched_param_sz = sizeof(struct sched_param);
++#endif
+   unsigned pthread_t_sz = sizeof(pthread_t);
+   unsigned pthread_mutex_t_sz = sizeof(pthread_mutex_t);
+   unsigned pthread_cond_t_sz = sizeof(pthread_cond_t);
+   unsigned pid_t_sz = sizeof(pid_t);
+   unsigned timeval_sz = sizeof(timeval);
+-  unsigned uid_t_sz = sizeof(uid_t);
+-  unsigned gid_t_sz = sizeof(gid_t);
+   unsigned mbstate_t_sz = sizeof(mbstate_t);
+   unsigned sigset_t_sz = sizeof(sigset_t);
+-  unsigned struct_timezone_sz = sizeof(struct timezone);
+   unsigned struct_tms_sz = sizeof(struct tms);
+-  unsigned struct_sigevent_sz = sizeof(struct sigevent);
+-  unsigned struct_sched_param_sz = sizeof(struct sched_param);
+ 
+ 
+ #if SANITIZER_MAC && !SANITIZER_IOS
+   unsigned struct_statfs64_sz = sizeof(struct statfs64);
+ #endif // SANITIZER_MAC && !SANITIZER_IOS
+ 
+-#if !SANITIZER_ANDROID
++#if !SANITIZER_ANDROID && !SANITIZER_CLOUDABI
+   unsigned struct_statfs_sz = sizeof(struct statfs);
+   unsigned struct_sockaddr_sz = sizeof(struct sockaddr);
+   unsigned ucontext_t_sz = sizeof(ucontext_t);
+@@ -245,9 +254,12 @@ namespace __sanitizer {
+   unsigned struct_oldold_utsname_sz = sizeof(struct oldold_utsname);
+ #endif // SANITIZER_LINUX
+ 
++#if SANITIZER_LINUX || SANITIZER_FREEBSD || SANITIZER_CLOUDABI
++  unsigned struct_timespec_sz = sizeof(struct timespec);
++#endif
++
+ #if SANITIZER_LINUX || SANITIZER_FREEBSD
+   unsigned struct_rlimit_sz = sizeof(struct rlimit);
+-  unsigned struct_timespec_sz = sizeof(struct timespec);
+   unsigned struct_utimbuf_sz = sizeof(struct utimbuf);
+   unsigned struct_itimerspec_sz = sizeof(struct itimerspec);
+ #endif // SANITIZER_LINUX || SANITIZER_FREEBSD
+@@ -265,6 +277,7 @@ namespace __sanitizer {
+   unsigned struct_statvfs_sz = sizeof(struct statvfs);
+ #endif // (SANITIZER_LINUX || SANITIZER_FREEBSD) && !SANITIZER_ANDROID
+ 
++#if !SANITIZER_CLOUDABI
+   const uptr sig_ign = (uptr)SIG_IGN;
+   const uptr sig_dfl = (uptr)SIG_DFL;
+   const uptr sig_err = (uptr)SIG_ERR;
+@@ -273,6 +286,7 @@ namespace __sanitizer {
+ #if SANITIZER_LINUX
+   int e_tabsz = (int)E_TABSZ;
+ #endif
++#endif
+ 
+ 
+ #if (SANITIZER_LINUX || SANITIZER_FREEBSD) && !SANITIZER_ANDROID
+@@ -284,10 +298,10 @@ namespace __sanitizer {
+   int shmctl_shm_stat = (int)SHM_STAT;
+ #endif
+ 
+-#if !SANITIZER_MAC && !SANITIZER_FREEBSD
++#if !SANITIZER_MAC && !SANITIZER_FREEBSD && !SANITIZER_CLOUDABI
+   unsigned struct_utmp_sz = sizeof(struct utmp);
+ #endif
+-#if !SANITIZER_ANDROID
++#if !SANITIZER_ANDROID && !SANITIZER_CLOUDABI
+   unsigned struct_utmpx_sz = sizeof(struct utmpx);
+ #endif
+ 
+@@ -305,7 +319,7 @@ namespace __sanitizer {
+       return 0;
+   }
+ 
+-#if SANITIZER_LINUX
++#if SANITIZER_LINUX || SANITIZER_CLOUDABI
+ unsigned struct_ElfW_Phdr_sz = sizeof(ElfW(Phdr));
+ #elif SANITIZER_FREEBSD
+ unsigned struct_ElfW_Phdr_sz = sizeof(Elf_Phdr);
+@@ -398,12 +412,14 @@ unsigned struct_ElfW_Phdr_sz = sizeof(Elf_Phdr);
+ #endif // PTRACE_GETREGSET/PTRACE_SETREGSET
+ #endif
+ 
++#if !SANITIZER_CLOUDABI
+   unsigned path_max = PATH_MAX;
+ 
+   // ioctl arguments
+   unsigned struct_ifreq_sz = sizeof(struct ifreq);
+   unsigned struct_termios_sz = sizeof(struct termios);
+   unsigned struct_winsize_sz = sizeof(struct winsize);
++#endif
+ 
+ #if SANITIZER_LINUX
+   unsigned struct_arpreq_sz = sizeof(struct arpreq);
+@@ -485,17 +501,19 @@ unsigned struct_ElfW_Phdr_sz = sizeof(Elf_Phdr);
+   unsigned struct_ppp_stats_sz = sizeof(struct ppp_stats);
+ #endif // (SANITIZER_LINUX || SANITIZER_FREEBSD) && !SANITIZER_ANDROID
+ 
+-#if !SANITIZER_ANDROID && !SANITIZER_MAC
++#if !SANITIZER_ANDROID && !SANITIZER_MAC && !SANITIZER_CLOUDABI
+   unsigned struct_sioc_sg_req_sz = sizeof(struct sioc_sg_req);
+   unsigned struct_sioc_vif_req_sz = sizeof(struct sioc_vif_req);
+ #endif
+ 
+   const unsigned IOCTL_NOT_PRESENT = 0;
+ 
++  unsigned IOCTL_FIONBIO = FIONBIO;
++  unsigned IOCTL_FIONREAD = FIONREAD;
++#if !SANITIZER_CLOUDABI
+   unsigned IOCTL_FIOASYNC = FIOASYNC;
+   unsigned IOCTL_FIOCLEX = FIOCLEX;
+   unsigned IOCTL_FIOGETOWN = FIOGETOWN;
+-  unsigned IOCTL_FIONBIO = FIONBIO;
+   unsigned IOCTL_FIONCLEX = FIONCLEX;
+   unsigned IOCTL_FIOSETOWN = FIOSETOWN;
+   unsigned IOCTL_SIOCADDMULTI = SIOCADDMULTI;
+@@ -934,13 +952,14 @@ unsigned struct_ElfW_Phdr_sz = sizeof(Elf_Phdr);
+ 
+   const int si_SEGV_MAPERR = SEGV_MAPERR;
+   const int si_SEGV_ACCERR = SEGV_ACCERR;
++#endif // SANITIZER_CLOUDABI
+ } // namespace __sanitizer
+ 
+ using namespace __sanitizer;
+ 
+ COMPILER_CHECK(sizeof(__sanitizer_pthread_attr_t) >= sizeof(pthread_attr_t));
+ 
+-COMPILER_CHECK(sizeof(socklen_t) == sizeof(unsigned));
++COMPILER_CHECK(sizeof(socklen_t) == sizeof(size_t));
+ CHECK_TYPE_SIZE(pthread_key_t);
+ 
+ #if SANITIZER_LINUX
+@@ -1013,29 +1032,40 @@ CHECK_SIZE_AND_OFFSET(iovec, iov_base);
+ CHECK_SIZE_AND_OFFSET(iovec, iov_len);
+ 
+ CHECK_TYPE_SIZE(msghdr);
++#if !SANITIZER_CLOUDABI
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_name);
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_namelen);
++#endif
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_iov);
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_iovlen);
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_control);
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_controllen);
+ CHECK_SIZE_AND_OFFSET(msghdr, msg_flags);
+ 
++// TODO
++#if !SANITIZER_CLOUDABI
+ CHECK_TYPE_SIZE(cmsghdr);
+ CHECK_SIZE_AND_OFFSET(cmsghdr, cmsg_len);
+ CHECK_SIZE_AND_OFFSET(cmsghdr, cmsg_level);
+ CHECK_SIZE_AND_OFFSET(cmsghdr, cmsg_type);
++#endif
+ 
++#if SANITIZER_CLOUDABI
+ COMPILER_CHECK(sizeof(__sanitizer_dirent) <= sizeof(dirent));
++#endif
+ CHECK_SIZE_AND_OFFSET(dirent, d_ino);
+ #if SANITIZER_MAC
+ CHECK_SIZE_AND_OFFSET(dirent, d_seekoff);
+-#elif SANITIZER_FREEBSD
++#elif SANITIZER_FREEBSD || SANITIZER_CLOUDABI
+ // There is no 'd_off' field on FreeBSD.
+ #else
+ CHECK_SIZE_AND_OFFSET(dirent, d_off);
+ #endif
++#if !SANITIZER_CLOUDABI
+ CHECK_SIZE_AND_OFFSET(dirent, d_reclen);
++#else
++CHECK_SIZE_AND_OFFSET(dirent, d_type);
++#endif
+ 
+ #if SANITIZER_LINUX && !SANITIZER_ANDROID
+ COMPILER_CHECK(sizeof(__sanitizer_dirent64) <= sizeof(dirent64));
+@@ -1044,9 +1074,11 @@ CHECK_SIZE_AND_OFFSET(dirent64, d_off);
+ CHECK_SIZE_AND_OFFSET(dirent64, d_reclen);
+ #endif
+ 
++#if !SANITIZER_CLOUDABI
+ CHECK_TYPE_SIZE(ifconf);
+ CHECK_SIZE_AND_OFFSET(ifconf, ifc_len);
+ CHECK_SIZE_AND_OFFSET(ifconf, ifc_ifcu);
++#endif
+ 
+ CHECK_TYPE_SIZE(pollfd);
+ CHECK_SIZE_AND_OFFSET(pollfd, fd);
+@@ -1055,6 +1087,7 @@ CHECK_SIZE_AND_OFFSET(pollfd, revents);
+ 
+ CHECK_TYPE_SIZE(nfds_t);
+ 
++#if !SANITIZER_CLOUDABI
+ CHECK_TYPE_SIZE(sigset_t);
+ 
+ COMPILER_CHECK(sizeof(__sanitizer_sigaction) == sizeof(struct sigaction));
+@@ -1072,6 +1105,7 @@ CHECK_STRUCT_SIZE_AND_OFFSET(sigaction, sa_flags);
+ #if SANITIZER_LINUX && (!SANITIZER_ANDROID || !SANITIZER_MIPS32)
+ CHECK_STRUCT_SIZE_AND_OFFSET(sigaction, sa_restorer);
+ #endif
++#endif
+ 
+ #if SANITIZER_LINUX
+ CHECK_TYPE_SIZE(__sysctl_args);
+@@ -1095,14 +1129,17 @@ CHECK_TYPE_SIZE(__kernel_loff_t);
+ CHECK_TYPE_SIZE(__kernel_fd_set);
+ #endif
+ 
+-#if !SANITIZER_ANDROID
++#if !SANITIZER_ANDROID && !SANITIZER_CLOUDABI
+ CHECK_TYPE_SIZE(wordexp_t);
+ CHECK_SIZE_AND_OFFSET(wordexp_t, we_wordc);
+ CHECK_SIZE_AND_OFFSET(wordexp_t, we_wordv);
+ CHECK_SIZE_AND_OFFSET(wordexp_t, we_offs);
+ #endif
+ 
++// TODO
++#if !SANITIZER_CLOUDABI
+ CHECK_TYPE_SIZE(tm);
++#endif
+ CHECK_SIZE_AND_OFFSET(tm, tm_sec);
+ CHECK_SIZE_AND_OFFSET(tm, tm_min);
+ CHECK_SIZE_AND_OFFSET(tm, tm_hour);
+@@ -1125,7 +1162,9 @@ CHECK_SIZE_AND_OFFSET(mntent, mnt_freq);
+ CHECK_SIZE_AND_OFFSET(mntent, mnt_passno);
+ #endif
+ 
++#if !SANITIZER_CLOUDABI
+ CHECK_TYPE_SIZE(ether_addr);
++#endif
+ 
+ #if (SANITIZER_LINUX || SANITIZER_FREEBSD) && !SANITIZER_ANDROID
+ CHECK_TYPE_SIZE(ipc_perm);
+@@ -1162,7 +1201,7 @@ CHECK_TYPE_SIZE(clock_t);
+ CHECK_TYPE_SIZE(clockid_t);
+ #endif
+ 
+-#if !SANITIZER_ANDROID
++#if !SANITIZER_ANDROID && !SANITIZER_CLOUDABI
+ CHECK_TYPE_SIZE(ifaddrs);
+ CHECK_SIZE_AND_OFFSET(ifaddrs, ifa_next);
+ CHECK_SIZE_AND_OFFSET(ifaddrs, ifa_name);
+@@ -1192,7 +1231,7 @@ CHECK_SIZE_AND_OFFSET(ifaddrs, ifa_data);
+ COMPILER_CHECK(sizeof(__sanitizer_mallinfo) == sizeof(struct mallinfo));
+ #endif
+ 
+-#if !SANITIZER_ANDROID
++#if !SANITIZER_ANDROID && !SANITIZER_CLOUDABI
+ CHECK_TYPE_SIZE(timeb);
+ CHECK_SIZE_AND_OFFSET(timeb, time);
+ CHECK_SIZE_AND_OFFSET(timeb, millitm);
+@@ -1200,6 +1239,7 @@ CHECK_SIZE_AND_OFFSET(timeb, timezone);
+ CHECK_SIZE_AND_OFFSET(timeb, dstflag);
+ #endif
+ 
++#if !SANITIZER_CLOUDABI
+ CHECK_TYPE_SIZE(passwd);
+ CHECK_SIZE_AND_OFFSET(passwd, pw_name);
+ CHECK_SIZE_AND_OFFSET(passwd, pw_passwd);
+@@ -1224,6 +1264,7 @@ CHECK_SIZE_AND_OFFSET(group, gr_name);
+ CHECK_SIZE_AND_OFFSET(group, gr_passwd);
+ CHECK_SIZE_AND_OFFSET(group, gr_gid);
+ CHECK_SIZE_AND_OFFSET(group, gr_mem);
++#endif
+ 
+ #if HAVE_RPC_XDR_H || HAVE_TIRPC_RPC_XDR_H
+ CHECK_TYPE_SIZE(XDR);
+diff --git a/lib/sanitizer_common/sanitizer_platform_limits_posix.h b/lib/sanitizer_common/sanitizer_platform_limits_posix.h
+index b1901fb..20864fd 100644
+--- a/lib/sanitizer_common/sanitizer_platform_limits_posix.h
++++ b/lib/sanitizer_common/sanitizer_platform_limits_posix.h
+@@ -15,11 +15,16 @@
+ #ifndef SANITIZER_PLATFORM_LIMITS_POSIX_H
+ #define SANITIZER_PLATFORM_LIMITS_POSIX_H
+ 
+-#if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_MAC
++#if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_MAC || SANITIZER_CLOUDABI
+ 
+ #include "sanitizer_internal_defs.h"
+ #include "sanitizer_platform.h"
+ 
++#if SANITIZER_CLOUDABI
++#include <time.h>
++#include <_/types.h>
++#endif
++
+ #if SANITIZER_FREEBSD
+ // FreeBSD's dlopen() returns a pointer to an Obj_Entry structure that
+ // incorporates the map structure.
+@@ -123,6 +128,10 @@ namespace __sanitizer {
+   const unsigned struct_kexec_segment_sz = 4 * sizeof(unsigned long);
+ #endif  // SANITIZER_LINUX
+ 
++#if SANITIZER_LINUX || SANITIZER_FREEBSD || SANITIZER_CLOUDABI
++  extern unsigned struct_timespec_sz;
++#endif
++
+ #if SANITIZER_LINUX || SANITIZER_FREEBSD
+ 
+ #if defined(__powerpc64__) || defined(__s390__)
+@@ -133,7 +142,6 @@ namespace __sanitizer {
+ 
+   extern unsigned struct_rlimit_sz;
+   extern unsigned struct_utimbuf_sz;
+-  extern unsigned struct_timespec_sz;
+ 
+   struct __sanitizer_iocb {
+     u64   aio_data;
+@@ -357,7 +365,7 @@ namespace __sanitizer {
+   };
+ #endif  // !SANITIZER_ANDROID
+ 
+-#if SANITIZER_MAC
++#if SANITIZER_MAC || SANITIZER_CLOUDABI
+   typedef unsigned long __sanitizer_pthread_key_t;
+ #else
+   typedef unsigned __sanitizer_pthread_key_t;
+@@ -435,7 +443,11 @@ namespace __sanitizer {
+     int tm_wday;
+     int tm_yday;
+     int tm_isdst;
++#if SANITIZER_CLOUDABI
++    int tm_gmtoff;
++#else
+     long int tm_gmtoff;
++#endif
+     const char *tm_zone;
+   };
+ 
+@@ -467,12 +479,19 @@ namespace __sanitizer {
+   };
+ #else
+   struct __sanitizer_msghdr {
++#if !SANITIZER_CLOUDABI
+     void *msg_name;
+     unsigned msg_namelen;
+     struct __sanitizer_iovec *msg_iov;
+     uptr msg_iovlen;
+     void *msg_control;
+     uptr msg_controllen;
++#else
++    struct __sanitizer_iovec *msg_iov;
++    int msg_iovlen;
++    void *msg_control;
++    size_t msg_controllen;
++#endif
+     int msg_flags;
+   };
+   struct __sanitizer_cmsghdr {
+@@ -500,6 +519,12 @@ namespace __sanitizer {
+     unsigned short d_reclen;
+     // more fields that we don't care about
+   };
++#elif SANITIZER_CLOUDABI
++  struct __sanitizer_dirent {
++    __ino_t d_ino;
++    __filetype_t d_type;
++    char d_name[];
++  };
+ #elif SANITIZER_ANDROID || defined(__x86_64__)
+   struct __sanitizer_dirent {
+     unsigned long long d_ino;
+@@ -526,7 +551,9 @@ namespace __sanitizer {
+ #endif
+ 
+ // 'clock_t' is 32 bits wide on x64 FreeBSD
+-#if SANITIZER_FREEBSD
++#if SANITIZER_CLOUDABI
++  typedef unsigned long long __sanitizer_clock_t;
++#elif SANITIZER_FREEBSD
+   typedef int __sanitizer_clock_t;
+ #elif defined(__x86_64__) && !defined(_LP64)
+   typedef long long __sanitizer_clock_t;
+@@ -534,7 +561,9 @@ namespace __sanitizer {
+   typedef long __sanitizer_clock_t;
+ #endif
+ 
+-#if SANITIZER_LINUX || SANITIZER_FREEBSD
++#if SANITIZER_CLOUDABI
++  typedef const struct ::__clockid *__sanitizer_clockid_t;
++#elif SANITIZER_LINUX || SANITIZER_FREEBSD
+   typedef int __sanitizer_clockid_t;
+ #endif
+ 
+@@ -646,7 +675,7 @@ namespace __sanitizer {
+ #if SANITIZER_FREEBSD
+     int sa_flags;
+     __sanitizer_sigset_t sa_mask;
+-#else
++#elif !SANITIZER_CLOUDABI
+ #if defined(__s390x__)
+     int sa_resv;
+ #else
+@@ -746,7 +775,11 @@ namespace __sanitizer {
+     int ai_family;
+     int ai_socktype;
+     int ai_protocol;
+-#if SANITIZER_ANDROID || SANITIZER_MAC || SANITIZER_FREEBSD
++#if SANITIZER_CLOUDABI
++    size_t ai_addrlen;
++    void *ai_addr;
++    char *ai_canonname;
++#elif SANITIZER_ANDROID || SANITIZER_MAC || SANITIZER_FREEBSD
+     unsigned ai_addrlen;
+     char *ai_canonname;
+     void *ai_addr;
+@@ -1064,6 +1097,10 @@ struct __sanitizer_cookie_io_functions_t {
+   // when it can not be determined without including any system headers.
+   extern const unsigned IOCTL_NOT_PRESENT;
+ 
++#if SANITIZER_CLOUDABI
++  extern unsigned IOCTL_FIONREAD;
++  extern unsigned IOCTL_FIONBIO;
++#else
+   extern unsigned IOCTL_FIOASYNC;
+   extern unsigned IOCTL_FIOCLEX;
+   extern unsigned IOCTL_FIOGETOWN;
+@@ -1479,6 +1516,7 @@ struct __sanitizer_cookie_io_functions_t {
+ 
+   extern const int si_SEGV_MAPERR;
+   extern const int si_SEGV_ACCERR;
++#endif /* CLOUDABI */
+ }  // namespace __sanitizer
+ 
+ #define CHECK_TYPE_SIZE(TYPE) \
+diff --git a/lib/sanitizer_common/sanitizer_posix.cc b/lib/sanitizer_common/sanitizer_posix.cc
+index 1fad71f..16f2b43 100644
+--- a/lib/sanitizer_common/sanitizer_posix.cc
++++ b/lib/sanitizer_common/sanitizer_posix.cc
+@@ -28,7 +28,12 @@
+ #include <signal.h>
+ #include <sys/mman.h>
+ 
+-#if SANITIZER_FREEBSD
++#if SANITIZER_CLOUDABI
++#include <cloudabi_types.h>
++#include <cloudabi_syscalls.h>
++#endif
++
++#if SANITIZER_FREEBSD || SANITIZER_CLOUDABI
+ // The MAP_NORESERVE define has been removed in FreeBSD 11.x, and even before
+ // that, it was never implemented.  So just define it to zero.
+ #undef  MAP_NORESERVE
+@@ -153,6 +158,7 @@ bool MprotectReadOnly(uptr addr, uptr size) {
+   return 0 == internal_mprotect((void *)addr, size, PROT_READ);
+ }
+ 
++#if !SANITIZER_CLOUDABI
+ fd_t OpenFile(const char *filename, FileAccessMode mode, error_t *errno_p) {
+   int flags;
+   switch (mode) {
+@@ -165,6 +171,7 @@ fd_t OpenFile(const char *filename, FileAccessMode mode, error_t *errno_p) {
+     return kInvalidFd;
+   return res;
+ }
++#endif
+ 
+ void CloseFile(fd_t fd) {
+   internal_close(fd);
+@@ -190,6 +197,7 @@ bool WriteToFile(fd_t fd, const void *buff, uptr buff_size, uptr *bytes_written,
+   return true;
+ }
+ 
++#if !SANITIZER_CLOUDABI
+ bool RenameFile(const char *oldpath, const char *newpath, error_t *error_p) {
+   uptr res = internal_rename(oldpath, newpath);
+   return !internal_iserror(res, error_p);
+@@ -205,6 +213,7 @@ void *MapFileToMemory(const char *file_name, uptr *buff_size) {
+   uptr map = internal_mmap(nullptr, *buff_size, PROT_READ, MAP_PRIVATE, fd, 0);
+   return internal_iserror(map) ? nullptr : (void *)map;
+ }
++#endif
+ 
+ void *MapWritableFileToMemory(void *addr, uptr size, fd_t fd, OFF_T offset) {
+   uptr flags = MAP_SHARED;
+@@ -295,6 +304,7 @@ bool GetCodeRangeForFile(const char *module, uptr *start, uptr *end) {
+   return false;
+ }
+ 
++#if !SANITIZER_CLOUDABI
+ uptr SignalContext::GetAddress() const {
+   auto si = static_cast<const siginfo_t *>(siginfo);
+   return (uptr)si->si_addr;
+@@ -324,6 +334,7 @@ const char *SignalContext::Describe() const {
+   }
+   return "UNKNOWN SIGNAL";
+ }
++#endif
+ 
+ } // namespace __sanitizer
+ 
+diff --git a/lib/sanitizer_common/sanitizer_posix.h b/lib/sanitizer_common/sanitizer_posix.h
+index adef082..d81c3a5 100644
+--- a/lib/sanitizer_common/sanitizer_posix.h
++++ b/lib/sanitizer_common/sanitizer_posix.h
+@@ -80,12 +80,14 @@ int real_pthread_join(void *th, void **ret);
+ 
+ int my_pthread_attr_getstack(void *attr, void **addr, uptr *size);
+ 
++#if !SANITIZER_CLOUDABI
+ // A routine named real_sigaction() must be implemented by each sanitizer in
+ // order for internal_sigaction() to bypass interceptors.
+ int internal_sigaction(int signum, const void *act, void *oldact);
+ void internal_sigfillset(__sanitizer_sigset_t *set);
+ void internal_sigemptyset(__sanitizer_sigset_t *set);
+ bool internal_sigismember(__sanitizer_sigset_t *set, int signum);
++#endif
+ 
+ uptr internal_execve(const char *filename, char *const argv[],
+                      char *const envp[]);
+diff --git a/lib/sanitizer_common/sanitizer_posix_libcdep.cc b/lib/sanitizer_common/sanitizer_posix_libcdep.cc
+index db41cad..a9d7fd4 100644
+--- a/lib/sanitizer_common/sanitizer_posix_libcdep.cc
++++ b/lib/sanitizer_common/sanitizer_posix_libcdep.cc
+@@ -36,22 +36,31 @@
+ #include <sys/stat.h>
+ #include <sys/time.h>
+ #include <sys/types.h>
+-#include <sys/wait.h>
+ #include <unistd.h>
+ 
+-#if SANITIZER_FREEBSD
++#if !SANITIZER_CLOUDABI
++#include <sys/wait.h>
++#endif
++
++#if SANITIZER_FREEBSD || SANITIZER_CLOUDABI
+ // The MAP_NORESERVE define has been removed in FreeBSD 11.x, and even before
+ // that, it was never implemented.  So just define it to zero.
+ #undef  MAP_NORESERVE
+ #define MAP_NORESERVE 0
+ #endif
+ 
++#if !SANITIZER_CLOUDABI
+ typedef void (*sa_sigaction_t)(int, siginfo_t *, void *);
++#endif
+ 
+ namespace __sanitizer {
+ 
+ u32 GetUid() {
++#if !SANITIZER_CLOUDABI
+   return getuid();
++#else
++  return 0;
++#endif
+ }
+ 
+ uptr GetThreadSelf() {
+@@ -66,7 +75,7 @@ void ReleaseMemoryPagesToOS(uptr beg, uptr end) {
+     // In the default Solaris compilation environment, madvise() is declared
+     // to take a caddr_t arg; casting it to void * results in an invalid
+     // conversion error, so use char * instead.
+-    madvise((char *)beg_aligned, end_aligned - beg_aligned,
++    posix_madvise((char *)beg_aligned, end_aligned - beg_aligned,
+             SANITIZER_MADVISE_DONTNEED);
+ }
+ 
+@@ -82,6 +91,7 @@ void DontDumpShadowMemory(uptr addr, uptr length) {
+ #endif
+ }
+ 
++#if !SANITIZER_CLOUDABI
+ static rlim_t getlim(int res) {
+   rlimit rlim;
+   CHECK_EQ(0, getrlimit(res, &rlim));
+@@ -128,6 +138,7 @@ void SetAddressSpaceUnlimited() {
+   setlim(RLIMIT_AS, RLIM_INFINITY);
+   CHECK(AddressSpaceIsUnlimited());
+ }
++#endif
+ 
+ void SleepForSeconds(int seconds) {
+   sleep(seconds);
+@@ -138,7 +149,7 @@ void SleepForMillis(int millis) {
+ }
+ 
+ void Abort() {
+-#if !SANITIZER_GO
++#if !SANITIZER_GO && !SANITIZER_CLOUDABI
+   // If we are handling SIGABRT, unhandle it first.
+   // TODO(vitalybuka): Check if handler belongs to sanitizer.
+   if (GetHandleSignalMode(SIGABRT) != kHandleSignalNo) {
+@@ -161,10 +172,20 @@ int Atexit(void (*function)(void)) {
+ }
+ 
+ bool SupportsColoredOutput(fd_t fd) {
++#if !SANITIZER_CLOUDABI
+   return isatty(fd) != 0;
++#else
++  return false;
++#endif
+ }
+ 
+-#if !SANITIZER_GO
++#if SANITIZER_CLOUDABI
++bool SignalContext::IsStackOverflow() const {
++  return addr + 512 > sp && addr < sp + 0xFFFF;
++}
++void SetAlternateSignalStack() {}
++void UnsetAlternateSignalStack() {}
++#elif !SANITIZER_GO
+ // TODO(glider): different tools may require different altstack size.
+ static const uptr kAltStackSize = SIGSTKSZ * 4;  // SIGSTKSZ is not enough.
+ 
+@@ -302,7 +323,7 @@ void PrepareForSandboxing(__sanitizer_sandbox_arguments *args) {
+ #endif
+ }
+ 
+-#if SANITIZER_ANDROID || SANITIZER_GO
++#if SANITIZER_ANDROID || SANITIZER_GO || SANITIZER_CLOUDABI
+ int GetNamedMappingFd(const char *name, uptr size) {
+   return -1;
+ }
+@@ -396,6 +417,7 @@ void *MmapNoAccess(uptr size) {
+   return (void *)internal_mmap(nullptr, size, PROT_NONE, flags, -1, 0);
+ }
+ 
++#if !SANITIZER_CLOUDABI
+ // This function is defined elsewhere if we intercepted pthread_attr_getstack.
+ extern "C" {
+ SANITIZER_WEAK_ATTRIBUTE int
+@@ -410,8 +432,9 @@ int my_pthread_attr_getstack(void *attr, void **addr, uptr *size) {
+ #endif
+   return pthread_attr_getstack((pthread_attr_t *)attr, addr, (size_t *)size);
+ }
++#endif
+ 
+-#if !SANITIZER_GO
++#if !SANITIZER_GO && !SANITIZER_CLOUDABI
+ void AdjustStackSize(void *attr_) {
+   pthread_attr_t *attr = (pthread_attr_t *)attr_;
+   uptr stackaddr = 0;
+@@ -438,6 +461,7 @@ void AdjustStackSize(void *attr_) {
+ }
+ #endif // !SANITIZER_GO
+ 
++#if !SANITIZER_CLOUDABI
+ pid_t StartSubprocess(const char *program, const char *const argv[],
+                       fd_t stdin_fd, fd_t stdout_fd, fd_t stderr_fd) {
+   auto file_closer = at_scope_exit([&] {
+@@ -510,6 +534,7 @@ int WaitForProcess(pid_t pid) {
+   }
+   return process_status;
+ }
++#endif
+ 
+ bool IsStateDetached(int state) {
+   return state == PTHREAD_CREATE_DETACHED;
+diff --git a/lib/sanitizer_common/sanitizer_printf.cc b/lib/sanitizer_common/sanitizer_printf.cc
+index 5c23600..0096ddf 100644
+--- a/lib/sanitizer_common/sanitizer_printf.cc
++++ b/lib/sanitizer_common/sanitizer_printf.cc
+@@ -254,6 +254,7 @@ static void NOINLINE SharedPrintfCodeNoBuffer(bool append_pid,
+         RAW_CHECK_MSG(needed_length < kLen, \
+                       "Buffer in Report is too short!\n"); \
+       }
++#if !SANITIZER_CLOUDABI
+     // Fuchsia's logging infrastructure always keeps track of the logging
+     // process, thread, and timestamp, so never prepend such information.
+     if (!SANITIZER_FUCHSIA && append_pid) {
+@@ -268,6 +269,7 @@ static void NOINLINE SharedPrintfCodeNoBuffer(bool append_pid,
+           buffer + needed_length, buffer_size - needed_length, "==%d==", pid);
+       CHECK_NEEDED_LENGTH
+     }
++#endif
+     needed_length += VSNPrintf(buffer + needed_length,
+                                buffer_size - needed_length, format, args);
+     CHECK_NEEDED_LENGTH
+diff --git a/lib/sanitizer_common/sanitizer_procmaps.h b/lib/sanitizer_common/sanitizer_procmaps.h
+index ea2cb7a..78a7ee5 100644
+--- a/lib/sanitizer_common/sanitizer_procmaps.h
++++ b/lib/sanitizer_common/sanitizer_procmaps.h
+@@ -17,7 +17,7 @@
+ #include "sanitizer_platform.h"
+ 
+ #if SANITIZER_LINUX || SANITIZER_FREEBSD || SANITIZER_NETBSD || \
+-    SANITIZER_MAC || SANITIZER_SOLARIS
++    SANITIZER_MAC || SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ 
+ #include "sanitizer_common.h"
+ #include "sanitizer_internal_defs.h"
+@@ -96,5 +96,5 @@ uptr ParseHex(const char **p);
+ }  // namespace __sanitizer
+ 
+ #endif  // SANITIZER_LINUX || SANITIZER_FREEBSD || SANITIZER_NETBSD ||
+-        // SANITIZER_MAC || SANITIZER_SOLARIS
++        // SANITIZER_MAC || SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ #endif  // SANITIZER_PROCMAPS_H
+diff --git a/lib/sanitizer_common/sanitizer_procmaps_cloudabi.cc b/lib/sanitizer_common/sanitizer_procmaps_cloudabi.cc
+new file mode 100644
+index 0000000..76d6f32
+--- /dev/null
++++ b/lib/sanitizer_common/sanitizer_procmaps_cloudabi.cc
+@@ -0,0 +1,285 @@
++//===-- sanitizer_procmaps_cloudabi.cc ---------------------------------------===//
++
++#include "sanitizer_platform.h"
++#if SANITIZER_CLOUDABI
++#include "sanitizer_common.h"
++#include "sanitizer_procmaps.h"
++
++#include <cloudabi_types.h>
++#include <cloudabi_syscalls.h>
++#include <cloudlibc_interceptors.h>
++#include <link.h>
++
++// There are no CloudABI system calls for requesting the current process memory
++// map. This code attempts to keep track of its own process memory map, by
++// reading the mapped binary and tracking all subsequent calls to mmap and
++// munmap.
++
++extern const void *__at_base;
++extern const ElfW(Phdr) *__at_phdr;
++extern const ElfW(Half) __at_phnum;
++
++namespace __sanitizer {
++
++// This is runtime-checked in the init function. If this is untrue, figure
++// out how to size CloudabiMemoryMapping correctly and efficiently
++static const size_t PAGE_SIZE = 4096;
++
++struct CloudabiMemoryMapping {
++  CloudabiMemoryMapping *next;
++  // This buffer contains MemoryMappedSegment structs
++  char segments[PAGE_SIZE - sizeof(void*)];
++};
++
++static_assert(sizeof(CloudabiMemoryMapping) == PAGE_SIZE, "CloudabiMemoryMapping should fill a page for efficiency");
++
++static const int NUM_SEGMENTS_PER_PAGE = sizeof(CloudabiMemoryMapping::segments) / sizeof(MemoryMappedSegment);
++
++static StaticSpinMutex mappings_lock;
++static int cloudabi_initialized = 0;
++static CloudabiMemoryMapping first;
++static CloudabiMemoryMapping *current;
++static CloudabiMemoryMapping *spare;
++static size_t capacity;
++static size_t index;
++
++static void cloudabi_mapping_added_locked(void *add, uptr length);
++
++static void init_cloudabi_procmaps() {
++  SpinMutexLock l(&mappings_lock);
++
++  CHECK(!cloudabi_initialized);
++  cloudabi_initialized = 1;
++
++  CHECK(PAGE_SIZE == GetPageSizeCached());
++
++  capacity = NUM_SEGMENTS_PER_PAGE;
++  index = 0;
++  first.next = NULL;
++  current = &first;
++
++  // Assume the initial CloudabiMemoryMapping contains enough space for the
++  // binary & stack mappings. If not, we'll have to call
++  // cloudabi_ensure_mapping_memory here.
++  CHECK(capacity >= __at_phnum);
++
++  // Make segments for the binary & stack
++  for(int i = 0; i < __at_phnum; ++i) {
++    cloudabi_mapping_added_locked((char*)__at_base + __at_phdr[i].p_vaddr, __at_phdr[i].p_memsz);
++  }
++
++  // And we should still have enough space for a spare CloudabiMemoryMapping
++  CHECK(capacity >= 1);
++
++  // And create our first spare CloudabiMemoryMapping
++  mappings_lock.Unlock();
++  try {
++    spare = (CloudabiMemoryMapping*)MmapOrDie(sizeof(CloudabiMemoryMapping), "CloudabiMemoryMapping");
++  } catch(...) {
++    mappings_lock.Lock();
++    throw;
++  }
++  spare->next = NULL;
++  internal_memset(spare->segments, 0, sizeof(spare->segments));
++  mappings_lock.Lock();
++}
++
++void cloudabi_mapping_removed(void *addr, uptr length) {
++  SpinMutexLock l(&mappings_lock);
++  CHECK(cloudabi_initialized);
++  // TODO: implement removing of a mapping from our list:
++  // - For all segments that partially overlap, adapt them to point only
++  //   at still-valid ranges.
++  // - For all segments that completely overlap with the range to remove,
++  //   write zeroes to the entire MemoryMappedSegment.
++  // - After this, it may be possible to defragment the CloudabiMemoryMapping
++  //   linked-list if none of the MemoryMappedSegment objects inside it are
++  //   filled, or only few are used and the CloudabiMemoryMapping objects around
++  //   it can take them over. This will reduce overhead in applications that
++  //   frequently add and remove mappings or that run for a long time.
++}
++
++static void cloudabi_ensure_mapping_memory() {
++  SpinMutexLock l(&mappings_lock);
++  CHECK(cloudabi_initialized);
++  CHECK(current);
++  CHECK(current->next == NULL);
++  if (capacity == 0) {
++    // No more capacity. First, we take the capacity from the spare mapping
++    CHECK(spare);
++    current->next = spare;
++    current = current->next;
++    CHECK(current->next == NULL);
++    spare = NULL;
++    capacity = NUM_SEGMENTS_PER_PAGE;
++    index = 0;
++
++    // Then, we allocate a new spare, temporarily dropping the lock because
++    // this'll call cloudabi_mapping_added to register this mapping
++    mappings_lock.Unlock();
++    try {
++      spare = (CloudabiMemoryMapping*)MmapOrDie(sizeof(CloudabiMemoryMapping), "CloudabiMemoryMapping");
++    } catch(...) {
++      mappings_lock.Lock();
++      throw;
++    }
++    spare->next = NULL;
++    internal_memset(spare->segments, 0, sizeof(spare->segments));
++    mappings_lock.Lock();
++  }
++  CHECK(capacity > 0);
++}
++
++static void cloudabi_mapping_added_locked(void *addr, uptr length) {
++  CHECK(cloudabi_initialized);
++
++  CHECK(capacity >= 1);
++  CHECK(index < NUM_SEGMENTS_PER_PAGE);
++
++  MemoryMappedSegment *segment = ((MemoryMappedSegment*)current->segments) + index;
++  index++;
++  capacity--;
++
++  segment->start = (uptr) addr;
++  segment->end = segment->start + length;
++  segment->offset = 0;
++  // TODO: set this correctly
++  segment->protection = kProtectionRead | kProtectionWrite | kProtectionExecute;
++
++/*
++  uptr func = (uptr)&ReadProcMaps;
++  uptr local = (uptr)&func;
++
++  bool is_func = func >= segment->start && func < segment->end;
++  bool is_stack = local >= segment->start && local < segment->end;
++
++  const char *descr = "";
++  if(is_func && is_stack) {
++    descr = "(func & stack)";
++  } else if(is_func) {
++    descr = "(func)";
++  } else if(is_stack) {
++    descr = "(stack)";
++  }
++
++  char clbuf[1024];
++  internal_snprintf(clbuf, sizeof(clbuf), "%d: 0x%llx - 0x%llx %s\n", i, segment->start, segment->end, descr);
++  cloudabi_debug(clbuf);
++*/
++}
++
++void cloudabi_mapping_added(void *addr, uptr length) {
++  if (!cloudabi_initialized) {
++    init_cloudabi_procmaps();
++  }
++
++  cloudabi_ensure_mapping_memory();
++
++  SpinMutexLock l(&mappings_lock);
++  cloudabi_mapping_added_locked(addr, length);
++}
++
++void ReadProcMaps(ProcSelfMapsBuff *proc_maps) {
++  if(!cloudabi_initialized) {
++    init_cloudabi_procmaps();
++  }
++
++  SpinMutexLock l(&mappings_lock);
++  bool have_fitting_allocation = false;
++  while (!have_fitting_allocation) {
++    size_t number_of_segments = 0;
++    for (CloudabiMemoryMapping *i = &first; i; i = i->next) {
++      for (size_t j = 0; j < NUM_SEGMENTS_PER_PAGE; ++j) {
++        MemoryMappedSegment *segment = ((MemoryMappedSegment*)i->segments) + j;
++        if (segment->end != 0) {
++          number_of_segments++;
++        }
++      }
++    }
++
++    // Allocate extra memory for segments, to be sure we'll have enough
++    // space after the MmapOrDie, which may cause number of segments to
++    // grow by an unguaranteed amount
++    size_t number_of_segments_with_margin = number_of_segments * 2;
++
++    proc_maps->mmaped_size = RoundUpTo(number_of_segments_with_margin * sizeof(MemoryMappedSegment), GetPageSizeCached());
++
++    // Temporarily drop the lock because this'll call cloudabi_mapping_added to register this mapping
++    mappings_lock.Unlock();
++
++    try {
++      proc_maps->data = (char*)MmapOrDie(proc_maps->mmaped_size, "ReadProcMaps buffer");
++    } catch(...) {
++      mappings_lock.Lock();
++      throw;
++    }
++
++    mappings_lock.Lock();
++    CHECK_NE(proc_maps->data, 0);
++
++    // See how many segments we have now
++    number_of_segments = 0;
++    for (CloudabiMemoryMapping *i = &first; i; i = i->next) {
++      for (size_t j = 0; j < NUM_SEGMENTS_PER_PAGE; ++j) {
++        MemoryMappedSegment *segment = ((MemoryMappedSegment*)i->segments) + j;
++        if (segment->end != 0) {
++          number_of_segments++;
++        }
++      }
++    }
++
++    if (number_of_segments <= number_of_segments_with_margin) {
++      have_fitting_allocation = true;
++      proc_maps->len = number_of_segments * sizeof(MemoryMappedSegment);
++      CHECK_LE(proc_maps->len, proc_maps->mmaped_size);
++    }
++  }
++
++  char *current = proc_maps->data;
++
++  // Memcpy the segments back
++  for (CloudabiMemoryMapping *i = &first; i; i = i->next) {
++    for (size_t j = 0; j < NUM_SEGMENTS_PER_PAGE; ++j) {
++      MemoryMappedSegment *segment = ((MemoryMappedSegment*)i->segments) + j;
++      if (segment->end != 0) {
++        CHECK_LE(current + sizeof(MemoryMappedSegment), proc_maps->data + proc_maps->len);
++
++        // TODO: this copy still isn't perfect, since it contains the filename pointer and
++        // data_ is still set.
++        MemoryMappedSegment *cur_seg = (MemoryMappedSegment*) current;
++        __cloudlibc_memcpy(cur_seg, segment, sizeof(MemoryMappedSegment));
++
++        current += sizeof(MemoryMappedSegment);
++      }
++    }
++  }
++
++  CHECK(current == proc_maps->data + proc_maps->len);
++}
++
++bool MemoryMappingLayout::Next(MemoryMappedSegment *segment) {
++  void *end_of_map = data_.proc_self_maps.data + data_.proc_self_maps.len;
++
++  // TODO: return segments in order! This is assumed by some parts of
++  // the code, but they work 'by chance' because we add the relevant
++  // segments first and in order.
++
++  if (data_.current == nullptr || data_.current == end_of_map) {
++    return false;
++  }
++
++  CHECK_LE(data_.current + sizeof(MemoryMappedSegment), end_of_map);
++
++  *segment = *(MemoryMappedSegment*)data_.current;
++
++  // Remove data_ from the segment, they shouldn't use it
++  segment->data_ = nullptr;
++
++  data_.current += sizeof(MemoryMappedSegment);
++
++  return true;
++}
++
++}  // namespace __sanitizer
++
++#endif  // SANITIZER_CLOUDABI
+diff --git a/lib/sanitizer_common/sanitizer_procmaps_common.cc b/lib/sanitizer_common/sanitizer_procmaps_common.cc
+index 0cd3e24..09ae93e 100644
+--- a/lib/sanitizer_common/sanitizer_procmaps_common.cc
++++ b/lib/sanitizer_common/sanitizer_procmaps_common.cc
+@@ -13,7 +13,7 @@
+ #include "sanitizer_platform.h"
+ 
+ #if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD || \
+-    SANITIZER_SOLARIS
++    SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ 
+ #include "sanitizer_common.h"
+ #include "sanitizer_placement_new.h"
+@@ -119,6 +119,7 @@ void MemoryMappingLayout::LoadFromCache() {
+ void MemoryMappingLayout::DumpListOfModules(
+     InternalMmapVectorNoCtor<LoadedModule> *modules) {
+   Reset();
++#if !SANITIZER_CLOUDABI
+   InternalScopedString module_name(kMaxPathLength);
+   MemoryMappedSegment segment(module_name.data(), module_name.size());
+   for (uptr i = 0; Next(&segment); i++) {
+@@ -142,9 +143,11 @@ void MemoryMappingLayout::DumpListOfModules(
+     segment.AddAddressRanges(&cur_module);
+     modules->push_back(cur_module);
+   }
++#endif
+ }
+ 
+ void GetMemoryProfile(fill_profile_f cb, uptr *stats, uptr stats_size) {
++#if !SANITIZER_CLOUDABI
+   char *smaps = nullptr;
+   uptr smaps_cap = 0;
+   uptr smaps_len = 0;
+@@ -166,9 +169,10 @@ void GetMemoryProfile(fill_profile_f cb, uptr *stats, uptr stats_size) {
+     while (*pos++ != '\n') {}
+   }
+   UnmapOrDie(smaps, smaps_cap);
++#endif
+ }
+ 
+ } // namespace __sanitizer
+ 
+ #endif // SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD ||
+-       // SANITIZER_SOLARIS
++       // SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+diff --git a/lib/sanitizer_common/sanitizer_stoptheworld_linux_libcdep.cc b/lib/sanitizer_common/sanitizer_stoptheworld_linux_libcdep.cc
+index 0f543d2..104aa84 100644
+--- a/lib/sanitizer_common/sanitizer_stoptheworld_linux_libcdep.cc
++++ b/lib/sanitizer_common/sanitizer_stoptheworld_linux_libcdep.cc
+@@ -14,7 +14,14 @@
+ 
+ #include "sanitizer_platform.h"
+ 
+-#if SANITIZER_LINUX && (defined(__x86_64__) || defined(__mips__) || \
++#if SANITIZER_CLOUDABI
++#include "sanitizer_stoptheworld.h"
++namespace __sanitizer {
++void StopTheWorld(StopTheWorldCallback callback, void *argument) {
++  UNIMPLEMENTED();
++}
++}
++#elif SANITIZER_LINUX && (defined(__x86_64__) || defined(__mips__) || \
+                         defined(__aarch64__) || defined(__powerpc64__) || \
+                         defined(__s390__) || defined(__i386__) || \
+                         defined(__arm__))
+diff --git a/lib/sanitizer_common/sanitizer_suppressions.cc b/lib/sanitizer_common/sanitizer_suppressions.cc
+index 89ddfdd..ead3903 100644
+--- a/lib/sanitizer_common/sanitizer_suppressions.cc
++++ b/lib/sanitizer_common/sanitizer_suppressions.cc
+@@ -48,6 +48,7 @@ static bool GetPathAssumingFileIsRelativeToExec(const char *file_path,
+ }
+ 
+ void SuppressionContext::ParseFromFile(const char *filename) {
++#if !SANITIZER_CLOUDABI
+   if (filename[0] == '\0')
+     return;
+ 
+@@ -76,6 +77,7 @@ void SuppressionContext::ParseFromFile(const char *filename) {
+   }
+ 
+   Parse(file_contents);
++#endif
+ }
+ 
+ bool SuppressionContext::Match(const char *str, const char *type,
+diff --git a/lib/sanitizer_common/sanitizer_symbolizer_libcdep.cc b/lib/sanitizer_common/sanitizer_symbolizer_libcdep.cc
+index a4bab66..3f6b0bc 100644
+--- a/lib/sanitizer_common/sanitizer_symbolizer_libcdep.cc
++++ b/lib/sanitizer_common/sanitizer_symbolizer_libcdep.cc
+@@ -166,7 +166,10 @@ bool Symbolizer::FindModuleNameAndOffsetForAddress(uptr address,
+ void Symbolizer::RefreshModules() {
+   modules_.init();
+   fallback_modules_.fallbackInit();
++#if !SANITIZER_CLOUDABI
++  // On CloudABI, modules_ will be 0
+   RAW_CHECK(modules_.size() > 0);
++#endif
+   modules_fresh_ = true;
+ }
+ 
+diff --git a/lib/sanitizer_common/sanitizer_symbolizer_posix_libcdep.cc b/lib/sanitizer_common/sanitizer_symbolizer_posix_libcdep.cc
+index 71d748d..0dcbc8d 100644
+--- a/lib/sanitizer_common/sanitizer_symbolizer_posix_libcdep.cc
++++ b/lib/sanitizer_common/sanitizer_symbolizer_posix_libcdep.cc
+@@ -31,9 +31,12 @@
+ #include <errno.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+-#include <sys/wait.h>
+ #include <unistd.h>
+ 
++#if !SANITIZER_CLOUDABI
++#include <sys/wait.h>
++#endif
++
+ #if SANITIZER_MAC
+ #include <util.h>  // for forkpty()
+ #endif  // SANITIZER_MAC
+@@ -76,8 +79,10 @@ static swift_demangle_ft swift_demangle_f;
+ // malloc and thread-local storage, which is not a good thing to do during
+ // symbolication.
+ static void InitializeSwiftDemangler() {
++#if !SANITIZER_CLOUDABI
+   swift_demangle_f = (swift_demangle_ft)dlsym(RTLD_DEFAULT, "swift_demangle");
+   (void)dlerror(); // Cleanup error message in case of failure
++#endif
+ }
+ 
+ // Attempts to demangle a Swift name. The demangler will return nullptr if a
+@@ -144,6 +149,10 @@ static bool CreateTwoHighNumberedPipes(int *infd_, int *outfd_) {
+ }
+ 
+ bool SymbolizerProcess::StartSymbolizerSubprocess() {
++#if SANITIZER_CLOUDABI
++  Report("WARNING: Can't start symbolizer on CloudABI\n");
++  return false;
++#else
+   if (!FileExists(path_)) {
+     if (!reported_invalid_path_) {
+       Report("WARNING: invalid path to external symbolizer!\n");
+@@ -249,6 +258,7 @@ bool SymbolizerProcess::StartSymbolizerSubprocess() {
+   }
+ 
+   return true;
++#endif
+ }
+ 
+ class Addr2LineProcess : public SymbolizerProcess {
+@@ -448,6 +458,10 @@ const char *Symbolizer::PlatformDemangle(const char *name) {
+ void Symbolizer::PlatformPrepareForSandboxing() {}
+ 
+ static SymbolizerTool *ChooseExternalSymbolizer(LowLevelAllocator *allocator) {
++#if SANITIZER_CLOUDABI
++  VReport(2, "No external symbolizer known on CloudABI.\n");
++  return nullptr;
++#else
+   const char *path = common_flags()->external_symbolizer_path;
+   const char *binary_name = path ? StripModuleName(path) : "";
+   if (path && path[0] == '\0') {
+@@ -493,6 +507,7 @@ static SymbolizerTool *ChooseExternalSymbolizer(LowLevelAllocator *allocator) {
+     }
+   }
+   return nullptr;
++#endif
+ }
+ 
+ static void ChooseSymbolizerTools(IntrusiveList<SymbolizerTool> *list,
+diff --git a/lib/sanitizer_common/sanitizer_unwind_linux_libcdep.cc b/lib/sanitizer_common/sanitizer_unwind_linux_libcdep.cc
+index 24c9470..223e85d 100644
+--- a/lib/sanitizer_common/sanitizer_unwind_linux_libcdep.cc
++++ b/lib/sanitizer_common/sanitizer_unwind_linux_libcdep.cc
+@@ -13,7 +13,7 @@
+ 
+ #include "sanitizer_platform.h"
+ #if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD || \
+-    SANITIZER_SOLARIS
++    SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+ #include "sanitizer_common.h"
+ #include "sanitizer_stacktrace.h"
+ 
+@@ -168,4 +168,4 @@ void BufferedStackTrace::SlowUnwindStackWithContext(uptr pc, void *context,
+ }  // namespace __sanitizer
+ 
+ #endif  // SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD ||
+-        // SANITIZER_SOLARIS
++        // SANITIZER_SOLARIS || SANITIZER_CLOUDABI
+diff --git a/lib/stats/stats.cc b/lib/stats/stats.cc
+index 6a6eb3a..d04fc9f 100644
+--- a/lib/stats/stats.cc
++++ b/lib/stats/stats.cc
+@@ -121,7 +121,7 @@ void USR2Handler(int sig) {
+ 
+ struct WriteReportOnExitOrSignal {
+   WriteReportOnExitOrSignal() {
+-#if SANITIZER_POSIX
++#if SANITIZER_POSIX && !SANITIZER_CLOUDABI
+     struct sigaction sigact;
+     internal_memset(&sigact, 0, sizeof(sigact));
+     sigact.sa_handler = USR2Handler;
+diff --git a/lib/stats/stats_client.cc b/lib/stats/stats_client.cc
+index 5caf097..89ced52 100644
+--- a/lib/stats/stats_client.cc
++++ b/lib/stats/stats_client.cc
+@@ -32,8 +32,10 @@ using namespace __sanitizer;
+ namespace {
+ 
+ void *LookupSymbolFromMain(const char *name) {
+-#ifdef _WIN32
++#if defined(_WIN32)
+   return reinterpret_cast<void *>(GetProcAddress(GetModuleHandle(0), name));
++#elif SANITIZER_CLOUDABI
++  return NULL;
+ #else
+   return dlsym(RTLD_DEFAULT, name);
+ #endif

@@ -6,6 +6,7 @@
 def build(ctx):
     root = ctx.extract('%(name)s-%(version)s.src')
     headers = ctx.extract('cloudlibc/v0.102').path('src/include')
+    abi_headers = ctx.extract('cloudabi/v0.20').path('headers')
 
     sources = {
         'absvdi2.c',
@@ -175,18 +176,161 @@ def build(ctx):
     library = ctx.archive(
         srcdir.path(f).compile([
             '-I%s' % headers,
-            '-DCRT_HAS_128BIT',
+            '-DCRT_HAS_128BIT=',
         ]) for f in sources)
     library.install('lib/libcompiler_rt.a')
 
+    asan_arch = None
+
+    if ctx.cpu() == 'i686':
+        asan_arch = 'i386'
+    elif ctx.cpu() == 'x86_64':
+        asan_arch = 'x86_64'
+
+    if asan_arch is not None:
+      asan_sources = {
+           'asan/asan_allocator.cc',
+           'asan/asan_activation.cc',
+           'asan/asan_cloudabi.cc',
+           'asan/asan_debugging.cc',
+           'asan/asan_descriptions.cc',
+           'asan/asan_errors.cc',
+           'asan/asan_fake_stack.cc',
+           'asan/asan_flags.cc',
+           'asan/asan_fuchsia.cc',
+           'asan/asan_globals.cc',
+           'asan/asan_globals_win.cc',
+           'asan/asan_interceptors.cc',
+           'asan/asan_interceptors_memintrinsics.cc',
+           'asan/asan_linux.cc',
+           'asan/asan_mac.cc',
+           'asan/asan_malloc_linux.cc',
+           'asan/asan_malloc_mac.cc',
+           'asan/asan_malloc_win.cc',
+           'asan/asan_memory_profile.cc',
+           'asan/asan_poisoning.cc',
+           'asan/asan_posix.cc',
+           'asan/asan_premap_shadow.cc',
+           'asan/asan_report.cc',
+           'asan/asan_rtl.cc',
+           'asan/asan_shadow_setup.cc',
+           'asan/asan_stack.cc',
+           'asan/asan_stats.cc',
+           'asan/asan_suppressions.cc',
+           'asan/asan_thread.cc',
+           'asan/asan_win.cc',
+           'asan/asan_preinit.cc',
+           'sanitizer_common/sanitizer_common_libcdep.cc',
+           'sanitizer_common/sanitizer_allocator_checks.cc',
+           'sanitizer_common/sancov_flags.cc',
+           'sanitizer_common/sanitizer_coverage_fuchsia.cc',
+           'sanitizer_common/sanitizer_coverage_libcdep_new.cc',
+           'sanitizer_common/sanitizer_coverage_win_sections.cc',
+           'sanitizer_common/sanitizer_linux_libcdep.cc',
+           'sanitizer_common/sanitizer_mac_libcdep.cc',
+           'sanitizer_common/sanitizer_posix_libcdep.cc',
+           'sanitizer_common/sanitizer_stacktrace_libcdep.cc',
+           'sanitizer_common/sanitizer_stoptheworld_linux_libcdep.cc',
+           'sanitizer_common/sanitizer_symbolizer_libcdep.cc',
+           'sanitizer_common/sanitizer_symbolizer_posix_libcdep.cc',
+           'sanitizer_common/sanitizer_unwind_linux_libcdep.cc',
+           'sanitizer_common/sanitizer_allocator.cc',
+           'sanitizer_common/sanitizer_cloudabi.cc',
+           'sanitizer_common/sanitizer_common.cc',
+           'sanitizer_common/sanitizer_deadlock_detector1.cc',
+           'sanitizer_common/sanitizer_deadlock_detector2.cc',
+           'sanitizer_common/sanitizer_errno.cc',
+           'sanitizer_common/sanitizer_file.cc',
+           'sanitizer_common/sanitizer_flags.cc',
+           'sanitizer_common/sanitizer_flag_parser.cc',
+           'sanitizer_common/sanitizer_fuchsia.cc',
+           'sanitizer_common/sanitizer_libc.cc',
+           'sanitizer_common/sanitizer_libignore.cc',
+           'sanitizer_common/sanitizer_linux.cc',
+           'sanitizer_common/sanitizer_linux_s390.cc',
+           'sanitizer_common/sanitizer_mac.cc',
+           'sanitizer_common/sanitizer_persistent_allocator.cc',
+           'sanitizer_common/sanitizer_platform_limits_linux.cc',
+           'sanitizer_common/sanitizer_platform_limits_netbsd.cc',
+           'sanitizer_common/sanitizer_platform_limits_posix.cc',
+           'sanitizer_common/sanitizer_platform_limits_solaris.cc',
+           'sanitizer_common/sanitizer_posix.cc',
+           'sanitizer_common/sanitizer_printf.cc',
+           'sanitizer_common/sanitizer_procmaps_common.cc',
+           'sanitizer_common/sanitizer_procmaps_freebsd.cc',
+           'sanitizer_common/sanitizer_procmaps_linux.cc',
+           'sanitizer_common/sanitizer_procmaps_mac.cc',
+           'sanitizer_common/sanitizer_procmaps_solaris.cc',
+           'sanitizer_common/sanitizer_procmaps_cloudabi.cc',
+           'sanitizer_common/sanitizer_solaris.cc',
+           'sanitizer_common/sanitizer_stackdepot.cc',
+           'sanitizer_common/sanitizer_stacktrace.cc',
+           'sanitizer_common/sanitizer_stacktrace_printer.cc',
+           'sanitizer_common/sanitizer_stoptheworld_mac.cc',
+           'sanitizer_common/sanitizer_suppressions.cc',
+           'sanitizer_common/sanitizer_symbolizer.cc',
+           'sanitizer_common/sanitizer_symbolizer_fuchsia.cc',
+           'sanitizer_common/sanitizer_symbolizer_libbacktrace.cc',
+           'sanitizer_common/sanitizer_symbolizer_mac.cc',
+           'sanitizer_common/sanitizer_symbolizer_win.cc',
+           'sanitizer_common/sanitizer_tls_get_addr.cc',
+           'sanitizer_common/sanitizer_thread_registry.cc',
+           'sanitizer_common/sanitizer_win.cc',
+           'sanitizer_common/sanitizer_termination.cc',
+           'interception/interception_cloudabi.cc',
+           'interception/interception_linux.cc',
+           'interception/interception_mac.cc',
+           'interception/interception_win.cc',
+           'interception/interception_type_test.cc',
+           'lsan/lsan_common.cc',
+           'lsan/lsan_common_linux.cc',
+           'lsan/lsan_common_mac.cc',
+           'lsan/lsan_common.cc',
+           'ubsan/ubsan_diag.cc',
+           'ubsan/ubsan_init.cc',
+           'ubsan/ubsan_flags.cc',
+           'ubsan/ubsan_handlers.cc',
+           'ubsan/ubsan_value.cc',
+      }
+      srcdir = root.path('lib')
+      library = ctx.archive(
+          srcdir.path(f).compile([
+              '-I%s' % headers,
+              '-I%s' % abi_headers,
+              '-I%s' % srcdir,
+              '-DHAVE_RPC_XDR_H=0',
+              '-DHAVE_TIRPC_RPC_XDR_H=0',
+              '-std=c++11',
+              '-Wno-macro-redefined',
+          ]) for f in asan_sources)
+      library.install('lib/libclang_rt.asan-%s.a' % asan_arch)
+
+      asan_cxx_sources = {
+           'asan/asan_new_delete.cc',
+           'ubsan/ubsan_handlers_cxx.cc',
+           'ubsan/ubsan_type_hash.cc',
+           'ubsan/ubsan_type_hash_itanium.cc',
+           'ubsan/ubsan_type_hash_win.cc',
+      }
+
+      library = ctx.archive(
+          srcdir.path(f).compile([
+              '-I%s' % headers,
+              '-I%s' % abi_headers,
+              '-I%s' % srcdir,
+              '-DUBSAN_CAN_USE_CXXABI',
+              '-std=c++11',
+          ]) for f in asan_cxx_sources)
+      library.install('lib/libclang_rt.asan_cxx-%s.a' % asan_arch)
 
 package(
     name='compiler-rt',
-    version='5.0.0',
+    version='6.0.0',
     homepage='http://compiler-rt.llvm.org/',
-    build_cmd=build)
+    build_cmd=build,
+    lib_depends={'cloudabi'})
 
 distfile(
-    name='compiler-rt-5.0.0.src.tar.xz',
-    checksum='d5ad5266462134a482b381f1f8115b6cad3473741b3bb7d1acc7f69fd0f0c0b3',
-    master_sites={'http://releases.llvm.org/5.0.0/'})
+    name='compiler-rt-6.0.0.src.tar.xz',
+    checksum='d0cc1342cf57e9a8d52f5498da47a3b28d24ac0d39cbc92308781b3ee0cea79a',
+    master_sites={'http://releases.llvm.org/6.0.0/'})
